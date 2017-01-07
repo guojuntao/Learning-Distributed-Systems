@@ -90,8 +90,10 @@ func (e *ClientEnd) Call(svcMeth string, args interface{}, reply interface{}) bo
 	qe.Encode(args)
 	req.args = qb.Bytes()
 
+    // gjt why chan, not cp
 	e.ch <- req
 
+    // gjt how to change req.reply
 	rep := <-req.replyCh
 	if rep.ok {
 		rb := bytes.NewBuffer(rep.reply)
@@ -299,7 +301,7 @@ func (rn *Network) DeleteServer(servername interface{}) {
 }
 
 // connect a ClientEnd to a server.
-// a ClientEnd can only be connected once in its lifetime.
+// a ClientEnd can only be connected once in its lifetime. // gjt 怎么保证一次
 func (rn *Network) Connect(endname interface{}, servername interface{}) {
 	rn.mu.Lock()
 	defer rn.mu.Unlock()
