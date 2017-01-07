@@ -2,6 +2,23 @@ package mapreduce
 
 import "fmt"
 
+const (
+	willDo = iota
+	doing
+	done
+)
+
+const (
+	waitDoing = -1
+	allDone   = -2
+)
+
+type chanMessage struct {
+	worker     string
+	taskNumber int
+	status     int
+}
+
 // schedule starts and waits for all tasks in the given phase (Map or Reduce).
 func (mr *Master) schedule(phase jobPhase) {
 	var ntasks int
@@ -24,5 +41,81 @@ func (mr *Master) schedule(phase jobPhase) {
 	//
 	// TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO TODO
 	//
+
+	workerDoneChannel := make(chan chanMessage)
+	tasksDoneStatus := make([]int, ntasks)
+
+	args := new(DoTaskArgs)
+	args.JobName = mr.jobName
+	args.Phase = phase
+	args.NumOtherPhase = nios
+
+	var worker string
+
+	// schedule 的主体不并发，控制复杂度，只有在调用 schedule_worker 才使用 go
+	for _, worker = range mr.workers {
+		args.TaskNumber = getTaskNumber(tasksDoneStatus)
+		if args.TaskNumber == waitDoing || args.TaskNumber == allDone {
+			break
+		}
+		args.File = mr.files[args.TaskNumber]
+		go schedule_worker(worker, *args, workerDoneChannel)
+	}
+
+	for {
+		// get idle worker
+		select {
+		case worker = <-mr.registerChannel:
+		case result := <-workerDoneChannel:
+			worker = result.worker
+			tasksDoneStatus[result.taskNumber] = result.status
+			if result.status == willDo {
+				// TODO: one failed, never use worker ?
+				// should allow somtimes failed
+				continue
+			}
+		}
+
+		args.TaskNumber = getTaskNumber(tasksDoneStatus)
+		if args.TaskNumber == allDone {
+			break
+		} else if args.TaskNumber == waitDoing {
+			continue
+		}
+
+		args.File = mr.files[args.TaskNumber]
+		go schedule_worker(worker, *args, workerDoneChannel)
+	}
+
 	fmt.Printf("Schedule: %v phase done\n", phase)
+}
+
+// TODO: 每次都从 0 遍历到 len(s)，性能太差。可以考虑添加 doneNumber
+// 每次从 doneNumber 遍历到 len(s), 如果没有 failures，每次只需遍历几个
+func getTaskNumber(s []int) int {
+	doingFlag := false
+	for i := 0; i < len(s); i++ {
+		if s[i] == willDo {
+			s[i] = doing
+			return i
+		} else if s[i] == doing {
+			doingFlag = true
+		}
+	}
+	if doingFlag == true {
+		return waitDoing
+	} else {
+		return allDone
+	}
+}
+
+// args 必须使用引用而不是指针，防止并发时相互影响
+func schedule_worker(worker string, args DoTaskArgs, c chan chanMessage) {
+	ok := call(worker, "Worker.DoTask", args, new(struct{}))
+	if ok == false {
+		fmt.Printf("Register: RPC %s register error\n", worker)
+		c <- chanMessage{worker, args.TaskNumber, willDo}
+	} else {
+		c <- chanMessage{worker, args.TaskNumber, done}
+	}
 }

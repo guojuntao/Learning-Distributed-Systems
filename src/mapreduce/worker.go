@@ -45,19 +45,23 @@ func (wk *Worker) Shutdown(_ *struct{}, res *ShutdownReply) error {
 	wk.Lock()
 	defer wk.Unlock()
 	res.Ntasks = wk.nTasks
+	// TODO: 正常逻辑下，shutdown 被调用，除非再调用一次 RPC
+	// 否则 wk.listen 还是一直 open 的. 所以我在下面添加了 close 的逻辑
 	wk.nRPC = 1
-	wk.nTasks-- // Don't count the shutdown RPC
+	wk.nTasks--  // Don't count the shutdown RPC
+	wk.l.Close() // causes the Accept to fail // add by gjt
 	return nil
 }
 
 // Tell the master we exist and ready to work
-func (wk *Worker) register(master string) {
+func (wk *Worker) register(master string) error {
 	args := new(RegisterArgs)
 	args.Worker = wk.name
 	ok := call(master, "Master.Register", args, new(struct{}))
 	if ok == false {
-		fmt.Printf("Register: RPC %s register error\n", master)
+		return fmt.Errorf("Register: RPC %s register error\n", master)
 	}
+	return nil
 }
 
 // RunWorker sets up a connection with the master, registers its address, and
@@ -81,12 +85,18 @@ func RunWorker(MasterAddress string, me string,
 		log.Fatal("RunWorker: worker ", me, " error: ", e)
 	}
 	wk.l = l
-	wk.register(MasterAddress)
+	e = wk.register(MasterAddress)
+	if e != nil {
+		// 注册失败的话，也没有必要往下走了
+		fmt.Println("RunWorker: worker ", me, " error: ", e)
+		return
+	}
 
 	// DON'T MODIFY CODE BELOW
 	for {
 		wk.Lock()
 		if wk.nRPC == 0 {
+			wk.l.Close() // add by gjt
 			wk.Unlock()
 			break
 		}
@@ -104,6 +114,8 @@ func RunWorker(MasterAddress string, me string,
 			break
 		}
 	}
-	wk.l.Close()
+	// TODO: 正常逻辑下，shutdown 被调用，除非再调用一次 RPC
+	// 否则走不到这里，wk.listen 还是一直 open 的
+	// wk.l.Close() // del by gjt
 	debug("RunWorker %s exit\n", me)
 }
