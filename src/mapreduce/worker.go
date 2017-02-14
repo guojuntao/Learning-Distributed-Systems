@@ -47,6 +47,7 @@ func (wk *Worker) Shutdown(_ *struct{}, res *ShutdownReply) error {
 	res.Ntasks = wk.nTasks
 	// TODO: 正常逻辑下，shutdown 被调用，除非再调用一次 RPC
 	// 否则 wk.listen 还是一直 open 的. 所以我在下面添加了 close 的逻辑
+	// Add comment 20170214, 在被调用的 RPC 里面关闭链接，可以返回吗？可以的
 	wk.nRPC = 1
 	wk.nTasks--  // Don't count the shutdown RPC
 	wk.l.Close() // causes the Accept to fail // add by gjt
@@ -106,6 +107,7 @@ func RunWorker(MasterAddress string, me string,
 			wk.Lock()
 			wk.nRPC--
 			wk.Unlock()
+			// TODO: 下一行的执行顺序跟 Shutdown 函数的执行顺序是怎样的？
 			go rpcs.ServeConn(conn)
 			wk.Lock()
 			wk.nTasks++

@@ -12,6 +12,9 @@ import (
 func (mr *Master) Shutdown(_, _ *struct{}) error {
 	debug("Shutdown: registration server\n")
 	// TODO: close(mr.shutdown) 有什么作用，close 下面的连接就够了 ?
+	// Add comment 20170214 按道理 close chan，下面的 select 应该会收到，但是没有
+	// 因为被 l 的 accept 阻塞了
+	// mr.shutdown <- struct{}{}
 	close(mr.shutdown)
 	mr.l.Close() // causes the Accept to fail
 	return nil
@@ -36,6 +39,7 @@ func (mr *Master) startRPCServer() {
 		for {
 			select {
 			case <-mr.shutdown:
+				// TODO: break to loop, for again ? or exit for, should exit for
 				break loop
 			default:
 			}

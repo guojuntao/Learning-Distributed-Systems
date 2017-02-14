@@ -22,7 +22,7 @@ type Master struct {
 	files   []string // Input files
 	nReduce int      // Number of reduce partitions
 
-	shutdown chan struct{}
+	shutdown chan struct{} // Add comment 20170214 shutdown 没有发挥作用? TODO
 	l        net.Listener
 	stats    []int
 }

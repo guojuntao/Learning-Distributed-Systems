@@ -53,6 +53,7 @@ func (mr *Master) schedule(phase jobPhase) {
 	var worker string
 
 	// schedule 的主体不并发，控制复杂度，只有在调用 schedule_worker 才使用 go
+	// 给现存的 worker 分配任务
 	for _, worker = range mr.workers {
 		args.TaskNumber = getTaskNumber(tasksDoneStatus)
 		if args.TaskNumber == waitDoing || args.TaskNumber == allDone {
@@ -72,6 +73,7 @@ func (mr *Master) schedule(phase jobPhase) {
 			if result.status == willDo {
 				// TODO: one failed, never use worker ?
 				// should allow somtimes failed
+				// 或者失败后应该调用 shutdown 去杀死 worker
 				continue
 			}
 		}
@@ -83,6 +85,7 @@ func (mr *Master) schedule(phase jobPhase) {
 			continue
 		}
 
+		// 分配新的任务给完成上一任务的worker
 		args.File = mr.files[args.TaskNumber]
 		go schedule_worker(worker, *args, workerDoneChannel)
 	}
@@ -110,6 +113,7 @@ func getTaskNumber(s []int) int {
 }
 
 // args 必须使用引用而不是指针，防止并发时相互影响
+// add comment 20170214 为什么要使用指针？
 func schedule_worker(worker string, args DoTaskArgs, c chan chanMessage) {
 	ok := call(worker, "Worker.DoTask", args, new(struct{}))
 	if ok == false {
