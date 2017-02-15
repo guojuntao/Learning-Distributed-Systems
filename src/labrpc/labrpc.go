@@ -90,10 +90,10 @@ func (e *ClientEnd) Call(svcMeth string, args interface{}, reply interface{}) bo
 	qe.Encode(args)
 	req.args = qb.Bytes()
 
-    // gjt why chan, not cp
+	// gjt why chan, not cp TODO good question
 	e.ch <- req
 
-    // gjt how to change req.reply
+	// gjt how to change req.reply
 	rep := <-req.replyCh
 	if rep.ok {
 		rb := bytes.NewBuffer(rep.reply)

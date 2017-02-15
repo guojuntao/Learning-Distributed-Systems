@@ -61,6 +61,7 @@ func (mr *Master) startRPCServer() {
 // stopRPCServer stops the master RPC server.
 // This must be done through an RPC to avoid race conditions between the RPC
 // server thread and the current thread.
+// Add commetn 20170215 看不懂前面的注释，哪来的条件竞争 TODO:
 func (mr *Master) stopRPCServer() {
 	// TODO: reply 有用？
 	var reply ShutdownReply

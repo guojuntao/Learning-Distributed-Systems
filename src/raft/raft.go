@@ -19,6 +19,8 @@ package raft
 
 import "sync"
 import "labrpc"
+import "math/rand"
+import "time"
 
 // import "bytes"
 // import "encoding/gob"
@@ -34,6 +36,12 @@ type ApplyMsg struct {
 	UseSnapshot bool   // ignore for lab2; only used in lab3
 	Snapshot    []byte // ignore for lab2; only used in lab3
 }
+
+const (
+	follower = iota
+	candidate
+	leader
+)
 
 //
 // A Go object implementing a single Raft peer.
@@ -58,8 +66,7 @@ type Raft struct {
 	nextIndex  []int
 	matchIndex []int
 
-	// TODO: need it ?
-	status Status
+	state int
 }
 
 // return currentTerm and whether this server
@@ -69,6 +76,13 @@ func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
 	// Your code here.
+	term = rf.currentTerm
+	if rf.state == leader {
+		isleader = true
+	} else {
+		isleader = false
+	}
+
 	return term, isleader
 }
 
@@ -123,10 +137,10 @@ type RequestVoteReply struct {
 //
 // example RequestVote RPC handler.
 //
-func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
+func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here.
 	// 收到对端的请求，进行回复
-	reply.term = currentTerm
+	reply.term = rf.currentTerm
 	if args.term < rf.currentTerm {
 		reply.voteGranted = false
 	} else {
@@ -181,7 +195,7 @@ func (rf *Raft) sendRequestVote(server int, args RequestVoteArgs, reply *Request
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := -1
 	term := -1
-	isLeader := true
+	isLeader := true // TODO: true ???
 
 	return index, term, isLeader
 }
@@ -215,14 +229,64 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here.
-	var timeChan chan interface{}
-	go func () {
-		// generate timeout channel
-		return 
-	}
-	go func () {
-		return 
-	}
+
+	// generate timeout channel
+	timeoutCh := make(chan struct{}, 1)
+
+	go func() {
+		// 产生一个随机值
+		r := rand.New(rand.NewSource(time.Now().UnixNano()))
+		timeout := r.Intn(1000000) // 0~1 second
+		count := 0
+
+		for {
+			// 当 raft 为 leader 的时候
+			select {
+			case <-applyCh:
+				timeout = r.Intn(1000000)
+				count = 0
+				// call ApplyMsg
+
+			case <-timeoutCh:
+				timeout = r.Intn(1000000)
+				count = 0
+
+				// reset status and send vote request
+				rf.state = candidate
+
+				args := RequestVoteArgs{}
+				args.term = rf.currentTerm
+				args.candidateId = me
+				args.lastLogIndex = rf.lastApplied
+				args.lastLogTerm = rf.currentTerm // TODO
+
+				reply := RequestVoteReply{}
+
+				// 投票请求应该并发
+				voteCount := 0
+				for _, e := range peers {
+					e.Call("Raft.RequestVote", &args, &reply)
+					if reply.voteGranted == false {
+						if reply.term > rf.currentTerm {
+							rf.currentTerm = reply.term
+						}
+					} else {
+						voteCount += 1
+					}
+				}
+				if voteCount*2 > len(peers) {
+					rf.state = leader
+				}
+
+			default:
+			}
+			time.Sleep(time.Microsecond) // 10 -6 second
+			count = count + 1
+			if count >= timeout {
+				timeoutCh <- struct{}{}
+			}
+		}
+	}()
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
