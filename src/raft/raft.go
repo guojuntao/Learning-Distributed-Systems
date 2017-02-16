@@ -17,6 +17,7 @@ package raft
 //   in the same server.
 //
 
+import "fmt"
 import "sync"
 import "labrpc"
 import "math/rand"
@@ -67,6 +68,8 @@ type Raft struct {
 	matchIndex []int
 
 	state int
+
+	applyCh chan ApplyMsg
 }
 
 // return currentTerm and whether this server
@@ -119,10 +122,10 @@ func (rf *Raft) readPersist(data []byte) {
 //
 type RequestVoteArgs struct {
 	// Your data here.
-	term         int
-	candidateId  int
-	lastLogIndex int
-	lastLogTerm  int
+	Term        int
+	CandidateId int
+	// lastLogIndex int
+	// lastLogTerm  int
 }
 
 //
@@ -130,8 +133,8 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here.
-	term        int
-	voteGranted bool
+	Term        int
+	VoteGranted bool
 }
 
 //
@@ -140,17 +143,24 @@ type RequestVoteReply struct {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here.
 	// 收到对端的请求，进行回复
-	reply.term = rf.currentTerm
-	if args.term < rf.currentTerm {
-		reply.voteGranted = false
+	reply.Term = rf.currentTerm
+
+	if args.Term < rf.currentTerm && rf.votedFor != -1 {
+		reply.VoteGranted = false
 	} else {
 		// term 不可能等于 currentTerm ？
-		if args.lastLogIndex < rf.lastApplied {
-			reply.voteGranted = false
-		} else {
-			reply.voteGranted = true
-		}
+		// if args.lastLogIndex < rf.lastApplied {
+		//	reply.voteGranted = false
+		//} else {
+		reply.VoteGranted = true
+		rf.votedFor = args.CandidateId
+		rf.currentTerm = args.Term
+		rf.state = follower
+		rf.applyCh <- ApplyMsg{}
+		//}
 	}
+
+	fmt.Println("IM", rf.me, rf.votedFor, args, reply)
 }
 
 func (rf *Raft) AppendEntries(args RequestVoteArgs, reply *RequestVoteReply) {
@@ -174,7 +184,7 @@ func (rf *Raft) AppendEntries(args RequestVoteArgs, reply *RequestVoteReply) {
 // that the caller passes the address of the reply struct with &, not
 // the struct itself.
 //
-func (rf *Raft) sendRequestVote(server int, args RequestVoteArgs, reply *RequestVoteReply) bool {
+func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	return ok
 }
@@ -229,61 +239,80 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here.
+	rf.votedFor = -1
+	rf.applyCh = applyCh
 
 	// generate timeout channel
 	timeoutCh := make(chan struct{}, 1)
 
 	go func() {
+		const maxTimeout = 100000
 		// 产生一个随机值
 		r := rand.New(rand.NewSource(time.Now().UnixNano()))
-		timeout := r.Intn(1000000) // 0~1 second
+		timeout := r.Intn(maxTimeout) // 0~1 second
 		count := 0
 
 		for {
-			// 当 raft 为 leader 的时候
+			// 当 raft 为 leader 的时候, 定期发心跳
 			select {
-			case <-applyCh:
-				timeout = r.Intn(1000000)
+			case <-rf.applyCh:
+				timeout = r.Intn(maxTimeout)
 				count = 0
 				// call ApplyMsg
 
 			case <-timeoutCh:
-				timeout = r.Intn(1000000)
+				fmt.Println("IM", rf.me, "timeout")
+				timeout = r.Intn(maxTimeout)
 				count = 0
 
 				// reset status and send vote request
 				rf.state = candidate
+				rf.votedFor = me
 
 				args := RequestVoteArgs{}
-				args.term = rf.currentTerm
-				args.candidateId = me
-				args.lastLogIndex = rf.lastApplied
-				args.lastLogTerm = rf.currentTerm // TODO
+				rf.currentTerm++
+				args.Term = rf.currentTerm
+				args.CandidateId = me
+				// args.lastLogIndex = rf.lastApplied
+				// args.lastLogTerm = rf.currentTerm // TODO
 
 				reply := RequestVoteReply{}
 
-				// 投票请求应该并发
+				// TODO: 投票请求应该并发
 				voteCount := 0
-				for _, e := range peers {
-					e.Call("Raft.RequestVote", &args, &reply)
-					if reply.voteGranted == false {
-						if reply.term > rf.currentTerm {
-							rf.currentTerm = reply.term
+				for i, _ := range peers {
+					if i != rf.me {
+						rf.sendRequestVote(i, &args, &reply)
+						// e.Call("Raft.RequestVote", &args, &reply)
+						if reply.VoteGranted == false {
+							if reply.Term > rf.currentTerm {
+								rf.currentTerm = reply.Term
+							}
+						} else {
+							voteCount += 1
 						}
-					} else {
-						voteCount += 1
 					}
 				}
-				if voteCount*2 > len(peers) {
+				if voteCount*2 >= len(peers) {
 					rf.state = leader
 				}
 
 			default:
 			}
+
 			time.Sleep(time.Microsecond) // 10 -6 second
 			count = count + 1
 			if count >= timeout {
 				timeoutCh <- struct{}{}
+			}
+		}
+	}()
+
+	// 当 raft 为 leader 的时候，定期发心跳
+	go func() {
+		time.Sleep(time.Microsecond) // 10 -6 second
+		if rf.state == leader {
+			for i, _ := range rf.peers {
 			}
 		}
 	}()

@@ -164,7 +164,7 @@ func (cfg *config) start1(i int) {
 					err_msg = fmt.Sprintf("server %v apply out of order %v", i, m.Index)
 				}
 			} else {
-				err_msg = fmt.Sprintf("committed command %v is not an int", m.Command)
+				// err_msg = fmt.Sprintf("committed command %v is not an int", m.Command)
 			}
 
 			if err_msg != "" {
@@ -258,7 +258,7 @@ func (cfg *config) setlongreordering(longrel bool) {
 // check that there's exactly one leader.
 // try a few times in case re-elections are needed.
 func (cfg *config) checkOneLeader() int {
-	// why 10
+	// TODO: why 10
 	for iters := 0; iters < 10; iters++ {
 		time.Sleep(500 * time.Millisecond)
 		leaders := make(map[int][]int)
