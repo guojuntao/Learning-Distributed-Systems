@@ -62,6 +62,7 @@ func TestReElection(t *testing.T) {
 	// be elected.
 	cfg.disconnect(leader2)
 	cfg.disconnect((leader2 + 1) % servers)
+	fmt.Println("befoer sleep")
 	time.Sleep(2 * RaftElectionTimeout)
 	cfg.checkNoLeader()
 
