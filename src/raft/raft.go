@@ -44,8 +44,8 @@ const (
 	leader
 )
 
-const timeoutMax = 300
-const timeoutMin = 150
+const timeoutMax = 500 // 300
+const timeoutMin = 250 // 150
 const heartbeatInterval = 100
 
 //
@@ -61,6 +61,7 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
+	// follow paper's Figure 2
 	currentTerm int
 	votedFor    int
 	log         []interface{}
@@ -71,15 +72,13 @@ type Raft struct {
 	nextIndex  []int
 	matchIndex []int
 
+	// 自己添加的
 	state int
 
-	applyCh chan ApplyMsg
-
-	// 用于超时，成为 candidate，发起选举
-	// TODO: add Mutex
-	r            *rand.Rand
-	timeoutCount int
-	timeout      int
+	timeMu  sync.Mutex
+	r       *rand.Rand
+	timer   int
+	timeout int
 }
 
 // return currentTerm and whether this server
@@ -132,10 +131,11 @@ func (rf *Raft) readPersist(data []byte) {
 //
 type RequestVoteArgs struct {
 	// Your data here.
-	Term        int
-	CandidateId int
-	// lastLogIndex int
-	// lastLogTerm  int
+	// follow paper's Figure 2
+	Term         int
+	CandidateId  int
+	LastLogIndex int
+	LastLogTerm  int
 }
 
 //
@@ -143,6 +143,7 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here.
+	// follow paper's Figure 2
 	Term        int
 	VoteGranted bool
 }
@@ -152,7 +153,6 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here.
-	// 收到对端的请求，进行回复
 
 	fmt.Println("IM", rf.me, rf.votedFor, rf.currentTerm, args, reply)
 
@@ -160,35 +160,32 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 	if args.Term <= rf.currentTerm {
 		reply.VoteGranted = false
 		reply.Term = rf.currentTerm
+
 	} else {
-		// term 不可能等于 currentTerm ？
-		// if args.lastLogIndex < rf.lastApplied {
-		//	reply.voteGranted = false
-		//} else {
 		rf.votedFor = args.CandidateId
 		rf.currentTerm = args.Term
-		rf.state = follower
-		rf.resetTimeout()
-		//rf.applyCh <- ApplyMsg{}
+		go rf.tobeFollower()
 
 		reply.VoteGranted = true
 		reply.Term = rf.currentTerm
-		//}
 	}
 
 	fmt.Println("IM", rf.me, rf.votedFor, rf.currentTerm, args, reply)
+	return
 }
 
 type AppendEntriesArgs struct {
-	Term     int
-	LeaderID int
-	// PrevLogIndex int
-	// PrevLogTerm  int
-	Entries []interface{}
-	// LeaderCommit int
+	// follow paper's Figure 2
+	Term         int
+	LeaderID     int
+	PrevLogIndex int
+	PrevLogTerm  int
+	Entries      []interface{}
+	LeaderCommit int
 }
 
 type AppendEntriesReply struct {
+	// follow paper's Figure 2
 	Term    int
 	Success bool
 }
@@ -202,13 +199,15 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
-		rf.state = follower
+		go rf.tobeFollower()
+	} else { // ==
+		rf.resetTimeout()
 	}
+
 	reply.Term = rf.currentTerm
 	reply.Success = true
-	rf.resetTimeout()
-	return
 
+	return
 }
 
 //
@@ -278,8 +277,13 @@ func (rf *Raft) Kill() {
 // for any long-running work.
 //
 
-func (rf *Raft) beCandidate() {
-	fmt.Println("IM", rf.me, "timeout")
+func (rf *Raft) tobeFollower() {
+	rf.state = follower
+	rf.resetTimeout()
+}
+
+func (rf *Raft) tobeCandidate() {
+	fmt.Println("IM", rf.me, "tobe candidate")
 	rf.resetTimeout()
 
 	// reset status and send vote request
@@ -296,7 +300,6 @@ func (rf *Raft) beCandidate() {
 
 	reply := RequestVoteReply{}
 
-	// TODO: 投票请求应该并发
 	results := make([]bool, len(rf.peers))
 	for i := 0; i < len(results); i++ {
 		if i == rf.me {
@@ -307,27 +310,29 @@ func (rf *Raft) beCandidate() {
 	}
 	resultCh := make(chan struct{})
 
-	for i, _ := range rf.peers {
-		// for i := 0; i < len(rf.peers); i++ {
-		fmt.Println(i, "iii")
+	for i := 0; i < len(rf.peers); i++ {
 		if i != rf.me {
-			go func(server int) {
-				ok := rf.sendRequestVote(server, args, &reply)
-				// e.Call("Raft.RequestVote", &args, &reply)
+			go func(index int) {
+				ok := rf.sendRequestVote(index, args, &reply)
+				// e.Call("Raft.RequestVote", args, &reply)
 				if ok {
+					// TODO 还需要其他处理吗
 					if reply.VoteGranted == false {
 						if reply.Term > rf.currentTerm {
 							rf.currentTerm = reply.Term
 						}
 					} else {
-						results[server] = true
+						// TODO: 需要锁吗
+						results[index] = true
 					}
+					// TODO 这个协程可能一直阻塞在这里，会被回收吗
 					resultCh <- struct{}{}
 				}
 			}(i)
 		}
 	}
 
+	// TODO: 这里的资源怎么回收，需要考虑吗？
 	for {
 		<-resultCh
 		voteCount := 0
@@ -336,14 +341,20 @@ func (rf *Raft) beCandidate() {
 				voteCount += 1
 			}
 		}
+		// TODO: 没有判断返回结果半数失败的情况，这种情况只能等超时重新选举
 		if voteCount*2 > len(rf.peers) && rf.currentTerm == candidateTerm {
-			fmt.Println("IM", rf.me, "become leader")
-			rf.state = leader
-			rf.sendHeartbeat()
+			go rf.tobeLeader()
+			// 这里没接收信号，回复不了，怎么办
 			// close(resultCh) // TODO: 还是要记录所有投票的结果的
 			return
 		}
 	}
+}
+
+func (rf *Raft) tobeLeader() {
+	fmt.Println("IM", rf.me, "tobe leader")
+	rf.state = leader
+	rf.sendHeartbeat()
 }
 
 func (rf *Raft) sendHeartbeat() {
@@ -354,10 +365,10 @@ func (rf *Raft) sendHeartbeat() {
 
 	reply := AppendEntriesReply{}
 
-	// TODO: 心跳并发
-	for i, _ := range rf.peers {
+	for i := 0; i < len(rf.peers); i++ {
 		if i != rf.me {
 			go func(index int) {
+				// TODO: 需要记录结果吗？
 				rf.peers[index].Call("Raft.AppendEntries", args, &reply)
 			}(i)
 		}
@@ -370,7 +381,7 @@ func (rf *Raft) resetTimeout() {
 		rf.timeout = rf.r.Intn(timeoutMax)
 	}
 	fmt.Println(rf.me, "reset timeout", rf.timeout)
-	rf.timeoutCount = 0
+	rf.timer = 0
 }
 
 func Make(peers []*labrpc.ClientEnd, me int,
@@ -382,7 +393,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// Your initialization code here.
 	rf.votedFor = -1
-	rf.applyCh = applyCh // TODO: how to use applyCh
+	rf.state = follower
 
 	// generate timeout message
 	rf.r = rand.New(rand.NewSource(time.Now().UnixNano()))
@@ -394,10 +405,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 			time.Sleep(time.Millisecond)
 			if rf.state == follower || rf.state == candidate {
 				// follower 没有收到心跳包超时，candidate 发起一轮选举也会超时
-				rf.timeoutCount++
-				if rf.timeoutCount >= rf.timeout {
+				// candidate 在选举过程超时，也会发起新一轮选举
+				rf.timer++
+				if rf.timer >= rf.timeout {
 					// TODO: 发起的选举超时怎么退出？
-					go rf.beCandidate()
+					go rf.tobeCandidate()
 				}
 			}
 		}
@@ -409,7 +421,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 			time.Sleep(time.Millisecond * heartbeatInterval)
 			if rf.state == leader {
 				// 向所有 peer 发送心跳包
-				rf.sendHeartbeat()
+				go rf.sendHeartbeat()
 			}
 		}
 	}()
