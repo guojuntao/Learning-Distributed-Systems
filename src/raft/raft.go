@@ -75,7 +75,6 @@ type Raft struct {
 	// 自己添加的
 	state int
 
-	timeMu  sync.Mutex
 	r       *rand.Rand
 	timer   int
 	timeout int
@@ -248,9 +247,14 @@ func (rf *Raft) sendRequestVote(server int, args RequestVoteArgs, reply *Request
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
+
+	if rf.state != leader {
+		return -1, -1, false
+	}
+
 	index := -1
 	term := -1
-	isLeader := true // TODO: true ???
+	isLeader := true
 
 	return index, term, isLeader
 }
