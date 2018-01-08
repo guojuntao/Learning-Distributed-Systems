@@ -5,7 +5,7 @@ package shardkv
 import "labrpc"
 import "raft"
 import "sync"
-import "encoding/gob"
+import "labgob"
 
 
 
@@ -78,9 +78,9 @@ func (kv *ShardKV) Kill() {
 // for any long-running work.
 //
 func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister, maxraftstate int, gid int, masters []*labrpc.ClientEnd, make_end func(string) *labrpc.ClientEnd) *ShardKV {
-	// call gob.Register on structures you want
+	// call labgob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
-	gob.Register(Op{})
+	labgob.Register(Op{})
 
 	kv := new(ShardKV)
 	kv.me = me

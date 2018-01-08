@@ -1,7 +1,7 @@
 package raftkv
 
 import (
-	"encoding/gob"
+	"labgob"
 	"labrpc"
 	"log"
 	"raft"
@@ -69,19 +69,20 @@ func (kv *RaftKV) Kill() {
 // for any long-running work.
 //
 func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister, maxraftstate int) *RaftKV {
-	// call gob.Register on structures you want
+	// call labgob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
-	gob.Register(Op{})
+	labgob.Register(Op{})
 
 	kv := new(RaftKV)
 	kv.me = me
 	kv.maxraftstate = maxraftstate
 
-	// Your initialization code here.
+	// You may need initialization code here.
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
+	// You may need initialization code here.
 
 	return kv
 }

@@ -40,7 +40,14 @@ type config struct {
 	logs      []map[int]int // copy of each server's committed entries
 }
 
+var ncpu_once sync.Once
+
 func make_config(t *testing.T, n int, unreliable bool) *config {
+	ncpu_once.Do(func() {
+		if runtime.NumCPU() < 2 {
+			fmt.Printf("warning: only one CPU, which may conceal locking bugs\n")
+		}
+	})
 	runtime.GOMAXPROCS(4)
 	cfg := &config{}
 	cfg.t = t
@@ -145,26 +152,26 @@ func (cfg *config) start1(i int) {
 	go func() {
 		for m := range applyCh {
 			err_msg := ""
-			if m.UseSnapshot {
-				// ignore the snapshot
+			if m.CommandValid == false {
+				// ignore other types of ApplyMsg
 			} else if v, ok := (m.Command).(int); ok {
 				cfg.mu.Lock()
 				for j := 0; j < len(cfg.logs); j++ {
-					if old, oldok := cfg.logs[j][m.Index]; oldok && old != v {
+					if old, oldok := cfg.logs[j][m.CommandIndex]; oldok && old != v {
 						// some server has already committed a different value for this entry!
 						err_msg = fmt.Sprintf("commit index=%v server=%v %v != server=%v %v",
-							m.Index, i, m.Command, j, old)
+							m.CommandIndex, i, m.Command, j, old)
 					}
 				}
-				_, prevok := cfg.logs[i][m.Index-1]
-				cfg.logs[i][m.Index] = v
+				_, prevok := cfg.logs[i][m.CommandIndex-1]
+				cfg.logs[i][m.CommandIndex] = v
 				cfg.mu.Unlock()
 
-				if m.Index > 1 && prevok == false {
-					err_msg = fmt.Sprintf("server %v apply out of order %v", i, m.Index)
+				if m.CommandIndex > 1 && prevok == false {
+					err_msg = fmt.Sprintf("server %v apply out of order %v", i, m.CommandIndex)
 				}
 			} else {
-				// err_msg = fmt.Sprintf("committed command %v is not an int", m.Command)
+				err_msg = fmt.Sprintf("committed command %v is not an int", m.Command)
 			}
 
 			if err_msg != "" {
@@ -199,7 +206,7 @@ func (cfg *config) cleanup() {
 
 // attach server i to the net.
 func (cfg *config) connect(i int) {
-	fmt.Printf("connect(%d)\n", i)
+	// fmt.Printf("connect(%d)\n", i)
 
 	cfg.connected[i] = true
 
@@ -222,7 +229,7 @@ func (cfg *config) connect(i int) {
 
 // detach server i from the net.
 func (cfg *config) disconnect(i int) {
-	fmt.Printf("disconnect(%d)\n", i)
+	// fmt.Printf("disconnect(%d)\n", i)
 
 	cfg.connected[i] = false
 
@@ -258,7 +265,6 @@ func (cfg *config) setlongreordering(longrel bool) {
 // check that there's exactly one leader.
 // try a few times in case re-elections are needed.
 func (cfg *config) checkOneLeader() int {
-	// TODO: why 10
 	for iters := 0; iters < 10; iters++ {
 		time.Sleep(500 * time.Millisecond)
 		leaders := make(map[int][]int)
@@ -380,7 +386,11 @@ func (cfg *config) wait(index int, n int, startTerm int) interface{} {
 // same value, since nCommitted() checks this,
 // as do the threads that read from applyCh.
 // returns index.
-func (cfg *config) one(cmd int, expectedServers int) int {
+// if retry==true, may submit the command multiple
+// times, in case a leader fails just after Start().
+// if retry==false, calls Start() only once, in order
+// to simplify the early Lab 2B tests.
+func (cfg *config) one(cmd int, expectedServers int, retry bool) int {
 	t0 := time.Now()
 	starts := 0
 	for time.Since(t0).Seconds() < 10 {
@@ -417,6 +427,9 @@ func (cfg *config) one(cmd int, expectedServers int) int {
 					}
 				}
 				time.Sleep(20 * time.Millisecond)
+			}
+			if retry == false {
+				cfg.t.Fatalf("one(%v) failed to reach agreement", cmd)
 			}
 		} else {
 			time.Sleep(50 * time.Millisecond)

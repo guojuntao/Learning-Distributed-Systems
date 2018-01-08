@@ -2,7 +2,9 @@ package labrpc
 
 //
 // channel-based RPC, for 824 labs.
-// allows tests to disconnect RPC connections.
+//
+// simulates a network that can lose requests, lose replies,
+// delay messages, and entirely disconnect particular hosts.
 //
 // we will use the original labrpc.go to test your code for grading.
 // so, while you can modify this code to help you debug, please
@@ -10,7 +12,7 @@ package labrpc
 //
 // adapted from Go net/rpc/server.go.
 //
-// sends gob-encoded values to ensure that RPCs
+// sends labgob-encoded values to ensure that RPCs
 // don't include references to program objects.
 //
 // net := MakeNetwork() -- holds network, clients, servers.
@@ -48,7 +50,7 @@ package labrpc
 //   pass svc to srv.AddService()
 //
 
-import "encoding/gob"
+import "labgob"
 import "bytes"
 import "reflect"
 import "sync"
@@ -76,8 +78,8 @@ type ClientEnd struct {
 }
 
 // send an RPC, wait for the reply.
-// the return value indicates success; false means the
-// server couldn't be contacted.
+// the return value indicates success; false means that
+// no reply was received from the server.
 func (e *ClientEnd) Call(svcMeth string, args interface{}, reply interface{}) bool {
 	req := reqMsg{}
 	req.endname = e.endname
@@ -86,18 +88,16 @@ func (e *ClientEnd) Call(svcMeth string, args interface{}, reply interface{}) bo
 	req.replyCh = make(chan replyMsg)
 
 	qb := new(bytes.Buffer)
-	qe := gob.NewEncoder(qb)
+	qe := labgob.NewEncoder(qb)
 	qe.Encode(args)
 	req.args = qb.Bytes()
 
-	// gjt why chan, not cp TODO good question
 	e.ch <- req
 
-	// gjt how to change req.reply
 	rep := <-req.replyCh
 	if rep.ok {
 		rb := bytes.NewBuffer(rep.reply)
-		rd := gob.NewDecoder(rb)
+		rd := labgob.NewDecoder(rb)
 		if err := rd.Decode(reply); err != nil {
 			log.Fatalf("ClientEnd.Call(): decode reply: %v\n", err)
 		}
@@ -243,8 +243,12 @@ func (rn *Network) ProcessReq(req reqMsg) {
 		} else if longreordering == true && rand.Intn(900) < 600 {
 			// delay the response for a while
 			ms := 200 + rand.Intn(1+rand.Intn(2000))
-			time.Sleep(time.Duration(ms) * time.Millisecond)
-			req.replyCh <- reply
+			// Russ points out that this timer arrangement will decrease
+			// the number of goroutines, so that the race
+			// detector is less likely to get upset.
+			time.AfterFunc(time.Duration(ms)*time.Millisecond, func() {
+				req.replyCh <- reply
+			})
 		} else {
 			req.replyCh <- reply
 		}
@@ -260,8 +264,9 @@ func (rn *Network) ProcessReq(req reqMsg) {
 			// server in fairly rapid succession.
 			ms = (rand.Int() % 100)
 		}
-		time.Sleep(time.Duration(ms) * time.Millisecond)
-		req.replyCh <- replyMsg{false, nil}
+		time.AfterFunc(time.Duration(ms)*time.Millisecond, func() {
+			req.replyCh <- replyMsg{false, nil}
+		})
 	}
 
 }
@@ -301,7 +306,7 @@ func (rn *Network) DeleteServer(servername interface{}) {
 }
 
 // connect a ClientEnd to a server.
-// a ClientEnd can only be connected once in its lifetime. // gjt 怎么保证一次
+// a ClientEnd can only be connected once in its lifetime.
 func (rn *Network) Connect(endname interface{}, servername interface{}) {
 	rn.mu.Lock()
 	defer rn.mu.Unlock()
@@ -430,7 +435,7 @@ func (svc *Service) dispatch(methname string, req reqMsg) replyMsg {
 
 		// decode the argument.
 		ab := bytes.NewBuffer(req.args)
-		ad := gob.NewDecoder(ab)
+		ad := labgob.NewDecoder(ab)
 		ad.Decode(args.Interface())
 
 		// allocate space for the reply.
@@ -444,7 +449,7 @@ func (svc *Service) dispatch(methname string, req reqMsg) replyMsg {
 
 		// encode the reply.
 		rb := new(bytes.Buffer)
-		re := gob.NewEncoder(rb)
+		re := labgob.NewEncoder(rb)
 		re.EncodeValue(replyv)
 
 		return replyMsg{true, rb.Bytes()}
