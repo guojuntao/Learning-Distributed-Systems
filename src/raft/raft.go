@@ -78,10 +78,12 @@ func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
 	// Your code here (2A).
+	rf.mu.Lock()
 	term = rf.currentTerm
 	if rf.state == LEADER {
 		isleader = true
 	}
+	rf.mu.Unlock()
 	return term, isleader
 }
 
@@ -151,6 +153,9 @@ type RequestVoteReply struct {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
 	if args.Term < rf.currentTerm ||
 		(args.Term == rf.currentTerm &&
 			args.CandidateId != rf.votedFor &&
@@ -159,16 +164,13 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.Term = rf.currentTerm
 
 	} else {
-		rf.mu.Lock()
 		rf.currentTerm = args.Term
 		rf.votedFor = args.CandidateId
 		rf.tobeFollowerCh <- struct{}{} // TODO: 会被阻塞吗?
-		rf.mu.Unlock()
 
 		reply.VoteGranted = true
 		reply.Term = rf.currentTerm
 	}
-
 	return
 }
 
@@ -223,6 +225,8 @@ type AppendEntriesReply struct {
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
 	// if args.Term == rf.currentTerm && args.LeaderID != rf.votedFor
 	// then 不改变 votedFor, 同时返回 success = true
@@ -232,13 +236,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	rf.mu.Lock()
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
 	}
 	rf.tobeFollowerCh <- struct{}{}
-	rf.mu.Unlock()
 
 	reply.Term = rf.currentTerm
 	reply.Success = true
@@ -353,8 +355,9 @@ func (rf *Raft) enterFollowerState() {
 	for {
 		select {
 		case <-timer.C:
-			// TODO: need lock?
+			rf.mu.Lock()
 			rf.state = CANDIDATE
+			rf.mu.Unlock()
 			return
 		case <-rf.tobeFollowerCh:
 			if !timer.Stop() {
@@ -370,8 +373,10 @@ func (rf *Raft) enterCandidateState() {
 	voteCh := make(chan RequestVoteReply, len(rf.peers))
 
 	votedCounter := 1
+	rf.mu.Lock()
 	rf.currentTerm = rf.currentTerm + 1
 	rf.votedFor = rf.me
+	rf.mu.Unlock()
 
 	for i := 0; i < len(rf.peers); i++ {
 		if i != rf.me {
@@ -393,8 +398,9 @@ func (rf *Raft) enterCandidateState() {
 			// TODO: need close voteCh?
 			return
 		case <-rf.tobeFollowerCh:
-			// TODO: need lock?
+			rf.mu.Lock()
 			rf.state = FOLLOWER
+			rf.mu.Unlock()
 			// TODO: need stop timer/ close voteCh?
 			return
 		case reply := <-voteCh:
@@ -412,8 +418,9 @@ func (rf *Raft) enterCandidateState() {
 			} else {
 				votedCounter = votedCounter + 1
 				if votedCounter >= len(rf.peers)/2+1 {
-					// TODO: need lock?
+					rf.mu.Lock()
 					rf.state = LEADER
+					rf.mu.Unlock()
 					return
 				}
 			}
