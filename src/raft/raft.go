@@ -170,9 +170,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	defer rf.mu.Unlock()
 
 	if args.Term < rf.currentTerm ||
-		(args.Term == rf.currentTerm &&
-			args.CandidateId != rf.votedFor &&
-			rf.votedFor != -1) {
+		(args.Term == rf.currentTerm && args.CandidateId != rf.votedFor && rf.votedFor != -1) ||
+		args.LastLogTerm < rf.log[rf.lastApplied].Term ||
+		(args.LastLogTerm == rf.log[rf.lastApplied].Term && args.LastLogIndex < rf.lastApplied) {
+
 		reply.VoteGranted = false
 		reply.Term = rf.currentTerm
 
@@ -257,7 +258,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	rf.tobeFollowerCh <- struct{}{}
 
-	reply.MatchIndex = -1
+	reply.MatchIndex = 0
 	// index 索引从 1 还是 0 开始, 1
 	// lastApplied == len(rf.log), len(rf.log) >= lastApplied
 	if len(rf.log) > args.PrevLogIndex && args.PrevLogTerm == rf.log[args.PrevLogIndex].Term {
@@ -439,7 +440,12 @@ func (rf *Raft) enterCandidateState() {
 
 	for i := 0; i < len(rf.peers); i++ {
 		if i != rf.me {
-			args := RequestVoteArgs{Term: rf.currentTerm, CandidateId: rf.me}
+			args := RequestVoteArgs{
+				Term:         rf.currentTerm,
+				CandidateId:  rf.me,
+				LastLogIndex: rf.lastApplied,
+				LastLogTerm:  rf.log[rf.lastApplied].Term,
+			}
 			reply := RequestVoteReply{}
 			go func(index int) {
 				// if not ok, retry, until enter other state
