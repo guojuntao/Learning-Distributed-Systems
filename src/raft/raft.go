@@ -54,8 +54,8 @@ const (
 // A Go object implementing a single Raft peer.
 //
 type Log struct {
-	term  int
-	entry interface{}
+	Term  int
+	Entry interface{}
 }
 
 type Raft struct {
@@ -80,6 +80,8 @@ type Raft struct {
 	tobeFollowerCh chan struct{}
 	// commandCh      chan interface{}
 	getRandTime func() time.Duration
+
+	apply func(int, int)
 }
 
 // return currentTerm and whether this server
@@ -258,7 +260,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.MatchIndex = -1
 	// index 索引从 1 还是 0 开始, 1
 	// lastApplied == len(rf.log), len(rf.log) >= lastApplied
-	if len(rf.log) > args.PrevLogIndex && args.PrevLogTerm == rf.log[args.PrevLogIndex].term {
+	if len(rf.log) > args.PrevLogIndex && args.PrevLogTerm == rf.log[args.PrevLogIndex].Term {
 		rf.lastApplied = args.PrevLogIndex
 		for _, entry := range args.Entries {
 			rf.lastApplied = rf.lastApplied + 1
@@ -266,7 +268,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 		reply.MatchIndex = rf.lastApplied
 		if rf.commitIndex < args.LeaderCommit { // TODO: 需要判断吗，如果小于会怎样
+			oldIndex := rf.commitIndex
 			rf.commitIndex = args.LeaderCommit
+			go rf.apply(oldIndex, rf.commitIndex)
 		}
 
 	}
@@ -274,6 +278,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Term = rf.currentTerm
 	reply.Success = true
 
+	DPrintln("AppendEntries", rf.me, args, reply)
 	return
 }
 
@@ -359,6 +364,12 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.getRandTime = randTimeBuilder()
 	rf.tobeFollowerCh = make(chan struct{})
 	// rf.commandCh = make(chan interface{})
+
+	rf.apply = func(oldIndex int, newIndex int) {
+		for i := oldIndex + 1; i <= newIndex; i++ {
+			applyCh <- ApplyMsg{true, rf.log[i].Entry, i}
+		}
+	}
 
 	go func() {
 		// state machine
@@ -500,11 +511,12 @@ func (rf *Raft) enterLeaderState() {
 						}
 						if rf.lastApplied+1 > rf.nextIndex[index] {
 							//for j= rf.nextIndex[index]; j < rf.lastApplied+1; j++ {
+							args.Entries = make([]Log, rf.lastApplied+1-rf.nextIndex[index])
 							args.Entries = rf.log[rf.nextIndex[index] : rf.lastApplied+1]
 						}
 						// if nextIndex[index] == 0
 						args.PrevLogIndex = rf.nextIndex[index] - 1
-						args.PrevLogTerm = rf.log[rf.nextIndex[index]-1].term
+						args.PrevLogTerm = rf.log[rf.nextIndex[index]-1].Term
 						args.LeaderCommit = rf.commitIndex
 						rf.mu.Unlock()
 
@@ -532,7 +544,9 @@ func (rf *Raft) enterLeaderState() {
 									}
 									// need reply.MatchIndex > rf.commitIndex ??
 									if cnt == len(rf.peers)/2+1 && reply.MatchIndex > rf.commitIndex {
+										oldIndex := rf.commitIndex
 										rf.commitIndex = reply.MatchIndex
+										go rf.apply(oldIndex, rf.commitIndex)
 									}
 								}
 							}
