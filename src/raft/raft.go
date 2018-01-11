@@ -497,18 +497,23 @@ func (rf *Raft) enterLeaderState() {
 	const heartbeatInterval = 100 * time.Millisecond
 	ticker := time.NewTicker(heartbeatInterval)
 
-	// init rf.nextIndex[]
+	rf.mu.Lock()
 	for i := 0; i < len(rf.nextIndex); i++ {
 		rf.nextIndex[i] = rf.lastApplied + 1
 		rf.matchIndex[i] = 0 // or -1 ?
 	}
+	rf.mu.Unlock()
 
 	for {
 		select {
 		case <-ticker.C:
 			// TODO: 执行到一半的时候，收到更高 term 的请求，怎么处理!!!
-			for i := 0; i < len(rf.peers); i++ {
-				if i != rf.me {
+			rf.mu.Lock()
+			length := len(rf.peers)
+			me := rf.me
+			rf.mu.Unlock()
+			for i := 0; i < length; i++ {
+				if i != me {
 					go func(index int) {
 						rf.mu.Lock()
 						args := AppendEntriesArgs{
@@ -560,13 +565,17 @@ func (rf *Raft) enterLeaderState() {
 						}
 					}(i)
 				} else {
+					rf.mu.Lock()
 					rf.nextIndex[i] = rf.lastApplied + 1
 					rf.matchIndex[i] = rf.lastApplied
+					rf.mu.Unlock()
 				}
 			}
 		// case command := <- rf.commandCh:
 		case <-rf.tobeFollowerCh:
+			rf.mu.Lock()
 			rf.state = FOLLOWER
+			rf.mu.Unlock()
 			// TODO: need stop ticker?
 			ticker.Stop()
 			return
