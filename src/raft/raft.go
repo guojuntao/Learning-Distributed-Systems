@@ -53,6 +53,11 @@ const (
 //
 // A Go object implementing a single Raft peer.
 //
+type Log struct {
+	term  int
+	entry interface{}
+}
+
 type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
@@ -65,10 +70,16 @@ type Raft struct {
 
 	currentTerm int
 	votedFor    int
+	log         []Log
+	commitIndex int
+	lastApplied int
+	nextIndex   []int
+	matchIndex  []int // 我觉得可以去掉？
 
 	state          State
 	tobeFollowerCh chan struct{}
-	getRandTime    func() time.Duration
+	// commandCh      chan interface{}
+	getRandTime func() time.Duration
 }
 
 // return currentTerm and whether this server
@@ -214,14 +225,16 @@ type AppendEntriesArgs struct {
 	LeaderID     int
 	PrevLogIndex int
 	PrevLogTerm  int
-	Entries      []interface{}
+	// Entries      []interface{}
+	Entries      []Log
 	LeaderCommit int
 }
 
 type AppendEntriesReply struct {
 	// follow paper's Figure 2
-	Term    int
-	Success bool
+	Term       int
+	Success    bool
+	MatchIndex int
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -241,6 +254,22 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.votedFor = -1
 	}
 	rf.tobeFollowerCh <- struct{}{}
+
+	reply.MatchIndex = -1
+	// index 索引从 1 还是 0 开始, 1
+	// lastApplied == len(rf.log), len(rf.log) >= lastApplied
+	if len(rf.log) > args.PrevLogIndex && args.PrevLogTerm == rf.log[args.PrevLogIndex].term {
+		rf.lastApplied = args.PrevLogIndex
+		for _, entry := range args.Entries {
+			rf.lastApplied = rf.lastApplied + 1
+			rf.log[rf.lastApplied] = entry // Log{args.Term, entry}
+		}
+		reply.MatchIndex = rf.lastApplied
+		if rf.commitIndex < args.LeaderCommit { // TODO: 需要判断吗，如果小于会怎样
+			rf.commitIndex = args.LeaderCommit
+		}
+
+	}
 
 	reply.Term = rf.currentTerm
 	reply.Success = true
@@ -272,7 +301,19 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
+	if rf.state != LEADER {
+		isLeader = false
+	} else {
+		rf.lastApplied = rf.lastApplied + 1
+		// or append
+		rf.log[rf.lastApplied] = Log{rf.currentTerm, command}
+
+		index = rf.lastApplied
+		term = rf.currentTerm
+	}
 	return index, term, isLeader
 }
 
@@ -305,12 +346,19 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
-	rf.currentTerm = 1 // TODO: or 0 ?
+	rf.currentTerm = 0 // TODO: or 1 ?
 	rf.votedFor = -1
+	rf.log = make([]Log, 1000) // should be init > 0
+	rf.log = append(rf.log, Log{0, nil})
+	rf.lastApplied = 0
+	rf.commitIndex = 0
+	rf.nextIndex = make([]int, len(rf.peers))
+	rf.matchIndex = make([]int, len(rf.peers))
 
 	rf.state = FOLLOWER
 	rf.getRandTime = randTimeBuilder()
 	rf.tobeFollowerCh = make(chan struct{})
+	// rf.commandCh = make(chan interface{})
 
 	go func() {
 		// state machine
@@ -432,38 +480,71 @@ func (rf *Raft) enterLeaderState() {
 	const heartbeatInterval = 100 * time.Millisecond
 	ticker := time.NewTicker(heartbeatInterval)
 
+	// init rf.nextIndex[]
+	for i := 0; i < len(rf.nextIndex); i++ {
+		rf.nextIndex[i] = rf.lastApplied + 1
+		rf.matchIndex[i] = 0 // or -1 ?
+	}
+
 	for {
 		select {
 		case <-ticker.C:
 			// TODO: 执行到一半的时候，收到更高 term 的请求，怎么处理!!!
 			for i := 0; i < len(rf.peers); i++ {
 				if i != rf.me {
-
 					go func(index int) {
+						rf.mu.Lock()
 						args := AppendEntriesArgs{
 							Term:     rf.currentTerm,
 							LeaderID: rf.me,
 						}
+						if rf.lastApplied+1 > rf.nextIndex[index] {
+							//for j= rf.nextIndex[index]; j < rf.lastApplied+1; j++ {
+							args.Entries = rf.log[rf.nextIndex[index] : rf.lastApplied+1]
+						}
+						// if nextIndex[index] == 0
+						args.PrevLogIndex = rf.nextIndex[index] - 1
+						args.PrevLogTerm = rf.log[rf.nextIndex[index]-1].term
+						args.LeaderCommit = rf.commitIndex
+						rf.mu.Unlock()
+
 						reply := AppendEntriesReply{}
 
 						// TODO: if return false value, retry?
 						if ok := rf.sendAppendEntries(index, &args, &reply); ok {
-							// TODO: if rf.state == LEADER
-							if reply.Success == false {
-								rf.mu.Lock()
-								if reply.Term > rf.currentTerm {
-									// TODO: tobeFollowerCh 有三个 <- , 可能同时触发吗？
-									rf.currentTerm = reply.Term
-									rf.votedFor = -1
-									rf.tobeFollowerCh <- struct{}{}
+							rf.mu.Lock()
+							if rf.state == LEADER {
+								if reply.Success == false {
+									if reply.Term > rf.currentTerm {
+										// TODO: tobeFollowerCh 有三个 <- , 可能同时触发吗？
+										rf.currentTerm = reply.Term
+										rf.votedFor = -1
+										rf.tobeFollowerCh <- struct{}{}
+									}
+								} else {
+									rf.nextIndex[index] = reply.MatchIndex + 1
+									rf.matchIndex[index] = reply.MatchIndex
+									var cnt int
+									for _, idx := range rf.matchIndex {
+										if idx >= reply.MatchIndex {
+											cnt = cnt + 1
+										}
+									}
+									// need reply.MatchIndex > rf.commitIndex ??
+									if cnt == len(rf.peers)/2+1 && reply.MatchIndex > rf.commitIndex {
+										rf.commitIndex = reply.MatchIndex
+									}
 								}
-								rf.mu.Unlock()
 							}
+							rf.mu.Unlock()
 						}
 					}(i)
-
+				} else {
+					rf.nextIndex[i] = rf.lastApplied + 1
+					rf.matchIndex[i] = rf.lastApplied
 				}
 			}
+		// case command := <- rf.commandCh:
 		case <-rf.tobeFollowerCh:
 			rf.state = FOLLOWER
 			// TODO: need stop ticker?
