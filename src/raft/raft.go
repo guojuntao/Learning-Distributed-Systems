@@ -1,5 +1,9 @@
 package raft
 
+// TODO list
+// 2. append rf.log
+// 3. stop timer & close voteCh
+
 //
 // this is an outline of the API that raft must expose to
 // the service (or tester). see comments below for
@@ -17,6 +21,7 @@ package raft
 //   in the same server.
 //
 
+import "fmt"
 import "sync"
 import "time"
 import "labrpc"
@@ -42,23 +47,17 @@ type ApplyMsg struct {
 	CommandIndex int
 }
 
-// TODO: type state
+type state int
+
 const (
-	FOLLOWER = iota
+	FOLLOWER state = iota
 	CANDIDATE
 	LEADER
 )
 
-type State int
-
-// TODO should be
-// type Entry struct {
-// 	Term int
-// 	Command interface{}
-// }
-type Log struct {
-	Term  int
-	Entry interface{}
+type Entry struct {
+	Term    int
+	Command interface{}
 }
 
 //
@@ -78,14 +77,14 @@ type Raft struct {
 	// from paper
 	currentTerm int
 	votedFor    int
-	log         []Log
+	log         []Entry
 	commitIndex int
 	lastApplied int
 	nextIndex   []int
 	matchIndex  []int
 
 	// add by myself
-	state          State
+	state          state
 	tobeFollowerCh chan struct{}
 	getRandTime    func() time.Duration
 	apply          func(int, int)
@@ -235,7 +234,7 @@ type AppendEntriesArgs struct {
 	LeaderID     int
 	PrevLogIndex int
 	PrevLogTerm  int
-	Entries      []Log
+	Entries      []Entry
 	LeaderCommit int
 }
 
@@ -272,7 +271,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		for _, entry := range args.Entries {
 			rf.lastApplied = rf.lastApplied + 1
 			// TODO 判断 log 长度，用 append or 插入
-			rf.log[rf.lastApplied] = entry // Log{args.Term, entry}
+			rf.log[rf.lastApplied] = entry // Entry{args.Term, entry}
 		}
 		reply.MatchIndex = rf.lastApplied
 		if rf.commitIndex < args.LeaderCommit { // TODO: 需要判断吗，如果小于会怎样
@@ -322,7 +321,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	} else {
 		rf.lastApplied = rf.lastApplied + 1
 		// TODO 判断 log 长度，用 append or 插入
-		rf.log[rf.lastApplied] = Log{rf.currentTerm, command}
+		rf.log[rf.lastApplied] = Entry{rf.currentTerm, command}
 
 		index = rf.lastApplied
 		term = rf.currentTerm
@@ -362,8 +361,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Your initialization code here (2A, 2B, 2C).
 	rf.currentTerm = 0 // TODO: or 1 ?
 	rf.votedFor = -1
-	rf.log = make([]Log, 1000) // TODO should be init > 0, but not too large
-	rf.log = append(rf.log, Log{0, nil})
+	rf.log = make([]Entry, 1000)           // TODO should be init > 0, but not too large
+	rf.log = append(rf.log, Entry{0, nil}) // init rf.log
 	rf.lastApplied = 0
 	rf.commitIndex = 0
 	rf.nextIndex = make([]int, len(rf.peers))
@@ -389,7 +388,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		for i := oldIndex + 1; i <= newIndex; i++ {
 			applyCh <- ApplyMsg{
 				CommandValid: true,
-				Command:      rf.log[i].Entry,
+				Command:      rf.log[i].Command,
 				CommandIndex: i,
 			}
 		}
@@ -407,7 +406,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 			case LEADER:
 				rf.enterLeaderState()
 			default:
-				panic("error state")
+				panic(fmt.Sprintln("Unknown state ", rf.state))
 			}
 		}
 	}()
@@ -419,7 +418,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 }
 
 func (rf *Raft) enterFollowerState() {
+	rf.mu.Lock()
 	DPrintln("[STATE] [I'm]", rf.me, "[Term]", rf.currentTerm, "[enterFollowerState]")
+	rf.mu.Unlock()
+
 	timer := time.NewTimer(rf.getRandTime())
 	for {
 		select {
@@ -439,7 +441,9 @@ func (rf *Raft) enterFollowerState() {
 }
 
 func (rf *Raft) enterCandidateState() {
+	rf.mu.Lock()
 	DPrintln("[STATE] [I'm]", rf.me, "[Term]", rf.currentTerm+1, "[enterCandidateState]")
+	rf.mu.Unlock()
 
 	rf.mu.Lock()
 	rf.currentTerm = rf.currentTerm + 1
@@ -450,7 +454,10 @@ func (rf *Raft) enterCandidateState() {
 	// TODO 可不可以不用 chan，用数组记录
 	voteCh := make(chan RequestVoteReply, len(rf.peers))
 
+	rf.mu.Lock()
 	DPrintln("[Candidate Send RequestVote] [I'm]", rf.me, "[Term]", rf.currentTerm)
+	rf.mu.Unlock()
+
 	for i := 0; i < len(rf.peers); i++ {
 		if i != rf.me {
 			args := RequestVoteArgs{
@@ -511,7 +518,10 @@ func (rf *Raft) enterCandidateState() {
 }
 
 func (rf *Raft) enterLeaderState() {
+	rf.mu.Lock()
 	DPrintln("[STATE] [I'm]", rf.me, "[Term]", rf.currentTerm, "[enterLeaderState]")
+	rf.mu.Unlock()
+
 	const heartbeatInterval = 100 * time.Millisecond
 	ticker := time.NewTicker(heartbeatInterval)
 
@@ -525,7 +535,10 @@ func (rf *Raft) enterLeaderState() {
 	for {
 		select {
 		case <-ticker.C:
+			rf.mu.Lock()
 			DPrintln("[Leader Send AppendEntries] [I'm]", rf.me, "[Term]", rf.currentTerm)
+			rf.mu.Unlock()
+
 			// TODO: 这个逻辑看能不能简化，太长了
 			// TODO: 执行到一半的时候，收到更高 term 的请求，怎么处理!!!
 			rf.mu.Lock()
@@ -545,7 +558,7 @@ func (rf *Raft) enterLeaderState() {
 							LeaderCommit: rf.commitIndex,
 						}
 						if rf.lastApplied+1 > rf.nextIndex[index] {
-							args.Entries = make([]Log, rf.lastApplied+1-rf.nextIndex[index])
+							args.Entries = make([]Entry, rf.lastApplied+1-rf.nextIndex[index])
 							args.Entries = rf.log[rf.nextIndex[index] : rf.lastApplied+1]
 						}
 						rf.mu.Unlock()
