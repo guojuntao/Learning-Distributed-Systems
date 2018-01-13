@@ -1,7 +1,6 @@
 package raft
 
 // TODO list
-// 2. append rf.log
 // 3. stop timer & close voteCh
 
 //
@@ -263,13 +262,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.tobeFollowerCh <- struct{}{}
 	reply.Term = rf.currentTerm
 
-	if len(rf.log) > args.PrevLogIndex && args.PrevLogTerm == rf.log[args.PrevLogIndex].Term {
-		rf.lastApplied = args.PrevLogIndex
-		for _, entry := range args.Entries {
-			rf.lastApplied = rf.lastApplied + 1
-			// TODO 判断 log 长度，用 append or 插入
-			rf.log[rf.lastApplied] = entry // Entry{args.Term, entry}
-		}
+	if rf.lastApplied >= args.PrevLogIndex && args.PrevLogTerm == rf.log[args.PrevLogIndex].Term {
+		rf.log = rf.log[:args.PrevLogIndex+1]
+		rf.log = append(rf.log, args.Entries...)
+		rf.lastApplied = args.PrevLogIndex + len(args.Entries)
 		if rf.commitIndex < args.LeaderCommit { // TODO: 需要判断吗，如果小于会怎样
 			oldIndex := rf.commitIndex
 			rf.commitIndex = args.LeaderCommit
@@ -316,8 +312,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		isLeader = false
 	} else {
 		rf.lastApplied = rf.lastApplied + 1
-		// TODO 判断 log 长度，用 append or 插入
-		rf.log[rf.lastApplied] = Entry{rf.currentTerm, command}
+		rf.log = append(rf.log, Entry{rf.currentTerm, command})
 
 		index = rf.lastApplied
 		term = rf.currentTerm
@@ -357,7 +352,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Your initialization code here (2A, 2B, 2C).
 	rf.currentTerm = 0 // TODO: or 1 ?
 	rf.votedFor = -1
-	rf.log = make([]Entry, 1000)           // TODO should be init > 0, but not too large
+	rf.log = make([]Entry, 0, 128)
 	rf.log = append(rf.log, Entry{0, nil}) // init rf.log
 	rf.lastApplied = 0
 	rf.commitIndex = 0
