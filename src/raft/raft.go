@@ -240,9 +240,8 @@ type AppendEntriesArgs struct {
 
 type AppendEntriesReply struct {
 	// follow paper's Figure 2
-	Term       int
-	Success    bool
-	MatchIndex int
+	Term    int
+	Success bool
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -262,10 +261,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.votedFor = -1
 	}
 	rf.tobeFollowerCh <- struct{}{}
+	reply.Term = rf.currentTerm
 
-	reply.MatchIndex = 0
-	// index 索引从 1 还是 0 开始, 1
-	// lastApplied == len(rf.log), len(rf.log) >= lastApplied
 	if len(rf.log) > args.PrevLogIndex && args.PrevLogTerm == rf.log[args.PrevLogIndex].Term {
 		rf.lastApplied = args.PrevLogIndex
 		for _, entry := range args.Entries {
@@ -273,17 +270,16 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			// TODO 判断 log 长度，用 append or 插入
 			rf.log[rf.lastApplied] = entry // Entry{args.Term, entry}
 		}
-		reply.MatchIndex = rf.lastApplied
 		if rf.commitIndex < args.LeaderCommit { // TODO: 需要判断吗，如果小于会怎样
 			oldIndex := rf.commitIndex
 			rf.commitIndex = args.LeaderCommit
 			go rf.apply(oldIndex, rf.commitIndex)
 		}
 
+		reply.Success = true
+	} else {
+		reply.Success = false
 	}
-
-	reply.Term = rf.currentTerm
-	reply.Success = true
 
 	DPrintf("[AppendEntries] [I'm] %d [Term] %d, [Args]%+v [Reply]%+v\n", rf.me, rf.currentTerm, args, reply)
 	return
@@ -557,9 +553,9 @@ func (rf *Raft) enterLeaderState() {
 							PrevLogTerm:  rf.log[rf.nextIndex[index]-1].Term,
 							LeaderCommit: rf.commitIndex,
 						}
-						if rf.lastApplied+1 > rf.nextIndex[index] {
-							args.Entries = make([]Entry, rf.lastApplied+1-rf.nextIndex[index])
-							args.Entries = rf.log[rf.nextIndex[index] : rf.lastApplied+1]
+						lastApplied := rf.lastApplied
+						if lastApplied+1 > rf.nextIndex[index] {
+							args.Entries = rf.log[rf.nextIndex[index] : lastApplied+1]
 						}
 						rf.mu.Unlock()
 
@@ -569,27 +565,30 @@ func (rf *Raft) enterLeaderState() {
 						if ok := rf.sendAppendEntries(index, &args, &reply); ok {
 							rf.mu.Lock()
 							if rf.state == LEADER {
-								if reply.Success == false {
+								if reply.Success == true {
+									if rf.matchIndex[index] != lastApplied {
+										rf.nextIndex[index] = lastApplied + 1
+										rf.matchIndex[index] = lastApplied
+
+										cnt := 0
+										for _, idx := range rf.matchIndex {
+											if idx >= lastApplied {
+												cnt = cnt + 1
+											}
+										}
+										if cnt == len(rf.peers)/2+1 && lastApplied > rf.commitIndex {
+											oldIndex := rf.commitIndex
+											rf.commitIndex = lastApplied
+											go rf.apply(oldIndex, rf.commitIndex)
+										}
+									}
+								} else {
+									// TODO: if enter here, 立刻重发?
+									rf.nextIndex[index] = rf.nextIndex[index] - 1
 									if reply.Term > rf.currentTerm {
-										// TODO: tobeFollowerCh 有三个 <- , 可能同时触发吗？
 										rf.currentTerm = reply.Term
 										rf.votedFor = -1
 										rf.tobeFollowerCh <- struct{}{}
-									}
-								} else {
-									rf.nextIndex[index] = reply.MatchIndex + 1
-									rf.matchIndex[index] = reply.MatchIndex
-									var cnt int
-									for _, idx := range rf.matchIndex {
-										if idx >= reply.MatchIndex {
-											cnt = cnt + 1
-										}
-									}
-									// TODO: need 判断 reply.MatchIndex > rf.commitIndex ??
-									if cnt == len(rf.peers)/2+1 && reply.MatchIndex > rf.commitIndex {
-										oldIndex := rf.commitIndex
-										rf.commitIndex = reply.MatchIndex
-										go rf.apply(oldIndex, rf.commitIndex)
 									}
 								}
 							}
@@ -598,8 +597,22 @@ func (rf *Raft) enterLeaderState() {
 					}(i)
 				} else {
 					rf.mu.Lock()
-					rf.nextIndex[i] = rf.lastApplied + 1
-					rf.matchIndex[i] = rf.lastApplied
+					if rf.matchIndex[i] != rf.lastApplied {
+						rf.nextIndex[i] = rf.lastApplied + 1
+						rf.matchIndex[i] = rf.lastApplied
+
+						cnt := 0
+						for _, idx := range rf.matchIndex {
+							if idx >= rf.lastApplied {
+								cnt = cnt + 1
+							}
+						}
+						if cnt == len(rf.peers)/2+1 && rf.lastApplied > rf.commitIndex {
+							oldIndex := rf.commitIndex
+							rf.commitIndex = rf.lastApplied
+							go rf.apply(oldIndex, rf.commitIndex)
+						}
+					}
 					rf.mu.Unlock()
 				}
 			}
