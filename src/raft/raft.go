@@ -311,6 +311,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	if rf.state != LEADER {
 		isLeader = false
 	} else {
+		DPrintln("[In start] [I'm]", rf.me, "[Term]", rf.currentTerm, "[command]", command)
 		rf.lastApplied = rf.lastApplied + 1
 		rf.log = append(rf.log, Entry{rf.currentTerm, command})
 
@@ -376,10 +377,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		}
 	}()
 	rf.apply = func(oldIndex int, newIndex int) {
+		rf.mu.Lock()
+		log := rf.log
+		rf.mu.Unlock()
 		for i := oldIndex + 1; i <= newIndex; i++ {
 			applyCh <- ApplyMsg{
 				CommandValid: true,
-				Command:      rf.log[i].Command,
+				Command:      log[i].Command,
 				CommandIndex: i,
 			}
 		}
@@ -513,6 +517,7 @@ func (rf *Raft) enterLeaderState() {
 	DPrintln("[STATE] [I'm]", rf.me, "[Term]", rf.currentTerm, "[enterLeaderState]")
 	rf.mu.Unlock()
 
+	// TODO: why "the tester limits you to 10 heartbeats per second" ?
 	const heartbeatInterval = 100 * time.Millisecond
 	ticker := time.NewTicker(heartbeatInterval)
 
@@ -540,6 +545,7 @@ func (rf *Raft) enterLeaderState() {
 			for i := 0; i < length; i++ {
 				if i != me {
 					go func(index int) {
+					SendAppendEntries:
 						rf.mu.Lock()
 						args := AppendEntriesArgs{
 							Term:         rf.currentTerm,
@@ -578,12 +584,14 @@ func (rf *Raft) enterLeaderState() {
 										}
 									}
 								} else {
-									// TODO: if enter here, 立刻重发?
 									rf.nextIndex[index] = rf.nextIndex[index] - 1
 									if reply.Term > rf.currentTerm {
 										rf.currentTerm = reply.Term
 										rf.votedFor = -1
 										rf.tobeFollowerCh <- struct{}{}
+									} else {
+										rf.mu.Unlock()
+										goto SendAppendEntries
 									}
 								}
 							}
