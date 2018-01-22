@@ -361,7 +361,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.matchIndex = make([]int, len(rf.peers))
 
 	rf.state = FOLLOWER
-	rf.tobeFollowerCh = make(chan struct{})
+	rf.tobeFollowerCh = make(chan struct{}, 1)
 	// 形式看起来有点绕，感觉自己屌屌的
 	rf.getRandTime = func() func() time.Duration {
 		const timeoutMax = 500 // 300
