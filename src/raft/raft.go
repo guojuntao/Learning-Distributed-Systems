@@ -545,16 +545,20 @@ func (rf *Raft) enterLeaderState() {
 			for i := 0; i < length; i++ {
 				if i != me {
 					go func(index int) {
+						rf.mu.Lock()
+						currentTerm := rf.currentTerm
+						lastApplied := rf.lastApplied
+						rf.mu.Unlock()
+
 					SendAppendEntries:
 						rf.mu.Lock()
 						args := AppendEntriesArgs{
-							Term:         rf.currentTerm,
+							Term:         currentTerm,
 							LeaderID:     rf.me,
 							PrevLogIndex: rf.nextIndex[index] - 1,
 							PrevLogTerm:  rf.log[rf.nextIndex[index]-1].Term,
 							LeaderCommit: rf.commitIndex,
 						}
-						lastApplied := rf.lastApplied
 						if lastApplied+1 > rf.nextIndex[index] {
 							args.Entries = rf.log[rf.nextIndex[index] : lastApplied+1]
 						}
@@ -584,12 +588,15 @@ func (rf *Raft) enterLeaderState() {
 										}
 									}
 								} else {
-									rf.nextIndex[index] = rf.nextIndex[index] - 1
 									if reply.Term > rf.currentTerm {
 										rf.currentTerm = reply.Term
 										rf.votedFor = -1
 										rf.tobeFollowerCh <- struct{}{}
 									} else {
+										rf.nextIndex[index] = rf.nextIndex[index] - 1
+										if rf.nextIndex[index] < 1 { // fix bug
+											rf.nextIndex[index] = 1
+										}
 										rf.mu.Unlock()
 										goto SendAppendEntries
 									}
