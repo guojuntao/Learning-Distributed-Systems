@@ -25,9 +25,8 @@ import "sync"
 import "time"
 import "labrpc"
 import "math/rand"
-
-// import "bytes"
-// import "labgob"
+import "bytes"
+import "labgob"
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -85,6 +84,7 @@ type Raft struct {
 	// add by myself
 	state          state
 	tobeFollowerCh chan struct{}
+	kill           bool
 	getRandTime    func() time.Duration
 	apply          func(int, int)
 }
@@ -105,6 +105,14 @@ func (rf *Raft) GetState() (int, bool) {
 	return term, isleader
 }
 
+type persistRaft struct {
+	CurrentTerm int
+	VotedFor    int
+	Log         []Entry
+	CommitIndex int
+	LastApplied int
+}
+
 //
 // save Raft's persistent state to stable storage,
 // where it can later be retrieved after a crash and restart.
@@ -113,12 +121,18 @@ func (rf *Raft) GetState() (int, bool) {
 func (rf *Raft) persist() {
 	// Your code here (2C).
 	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	// 调用 rf.persist need call rf.mu.Lock() before
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(persistRaft{
+		CurrentTerm: rf.currentTerm,
+		VotedFor:    rf.votedFor,
+		Log:         rf.log,
+		CommitIndex: rf.commitIndex,
+		LastApplied: rf.lastApplied,
+	})
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 //
@@ -127,17 +141,21 @@ func (rf *Raft) persist() {
 func (rf *Raft) readPersist(data []byte) {
 	// Your code here (2C).
 	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var pRf persistRaft
+	if err := d.Decode(&pRf); err != nil {
+		DPrintln("decode error", err)
+	} else {
+		rf.mu.Lock()
+		DPrintln("Im ", rf.me, "[readPersist]", pRf)
+		rf.currentTerm = pRf.CurrentTerm
+		rf.votedFor = pRf.VotedFor
+		rf.log = pRf.Log
+		rf.commitIndex = pRf.CommitIndex
+		rf.lastApplied = pRf.LastApplied
+		rf.mu.Unlock()
+	}
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
@@ -172,12 +190,19 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	defer rf.persist()
+	// defer print
 
 	if args.Term < rf.currentTerm ||
 		(args.Term == rf.currentTerm && args.CandidateId != rf.votedFor && rf.votedFor != -1) ||
 		args.LastLogTerm < rf.log[rf.lastApplied].Term ||
 		(args.LastLogTerm == rf.log[rf.lastApplied].Term && args.LastLogIndex < rf.lastApplied) {
 
+		if args.Term > rf.currentTerm {
+			rf.currentTerm = args.Term //FIXBUG,should\add\tobeFollowerCh???TODO
+			rf.votedFor = -1
+			rf.tobeFollowerCh <- struct{}{}
+		}
 		reply.VoteGranted = false
 		reply.Term = rf.currentTerm
 
@@ -246,13 +271,15 @@ type AppendEntriesReply struct {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	defer rf.persist()
+	// defer print
 
 	// if args.Term == rf.currentTerm && args.LeaderID != rf.votedFor
 	// then 不改变 votedFor, 同时返回 success = true，这种场景要思考一下 TODO
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
 		reply.Success = false
-		return
+		return // TODO: print
 	}
 
 	if args.Term > rf.currentTerm {
@@ -307,6 +334,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// Your code here (2B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	defer rf.persist()
 
 	if rf.state != LEADER {
 		isLeader = false
@@ -329,6 +357,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 //
 func (rf *Raft) Kill() {
 	// Your code here, if desired.
+	rf.mu.Lock()
+	rf.kill = true
+	rf.mu.Unlock()
 }
 
 //
@@ -351,7 +382,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
-	rf.currentTerm = 0 // TODO: or 1 ?
+	rf.currentTerm = 0
 	rf.votedFor = -1
 	rf.log = make([]Entry, 0, 128)
 	rf.log = append(rf.log, Entry{0, nil}) // init rf.log
@@ -362,7 +393,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	rf.state = FOLLOWER
 	rf.tobeFollowerCh = make(chan struct{}, 1)
-	// 形式看起来有点绕，感觉自己屌屌的
 	rf.getRandTime = func() func() time.Duration {
 		const timeoutMax = 500 // 300
 		const timeoutMin = 250 // 150
@@ -389,10 +419,15 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		}
 	}
 
+	// initialize from state persisted before a crash
+	rf.readPersist(persister.ReadRaftState())
+
 	// state machine
-	// TODO: 应该在 readPersist 之后再跑吗
 	go func() {
 		for {
+			if rf.kill == true {
+				return
+			}
 			switch rf.state {
 			case FOLLOWER:
 				rf.enterFollowerState()
@@ -405,9 +440,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 			}
 		}
 	}()
-
-	// initialize from state persisted before a crash
-	rf.readPersist(persister.ReadRaftState())
 
 	return rf
 }
@@ -444,6 +476,7 @@ func (rf *Raft) enterCandidateState() {
 	rf.currentTerm = rf.currentTerm + 1
 	rf.votedFor = rf.me
 	votedCounter := 1
+	rf.persist()
 	rf.mu.Unlock()
 
 	// TODO 可不可以不用 chan，用数组记录
@@ -453,14 +486,19 @@ func (rf *Raft) enterCandidateState() {
 	DPrintln("[Candidate Send RequestVote] [I'm]", rf.me, "[Term]", rf.currentTerm)
 	rf.mu.Unlock()
 
-	for i := 0; i < len(rf.peers); i++ {
-		if i != rf.me {
-			args := RequestVoteArgs{
-				Term:         rf.currentTerm,
-				CandidateId:  rf.me,
-				LastLogIndex: rf.lastApplied,
-				LastLogTerm:  rf.log[rf.lastApplied].Term,
-			}
+	rf.mu.Lock()
+	args := RequestVoteArgs{
+		Term:         rf.currentTerm,
+		CandidateId:  rf.me,
+		LastLogIndex: rf.lastApplied,
+		LastLogTerm:  rf.log[rf.lastApplied].Term,
+	}
+	length := len(rf.peers)
+	me := rf.me
+	rf.mu.Unlock()
+
+	for i := 0; i < length; i++ {
+		if i != me {
 			reply := RequestVoteReply{}
 			go func(index int) {
 				// TODO: if not ok, retry, until enter other state
@@ -484,13 +522,13 @@ func (rf *Raft) enterCandidateState() {
 			// TODO: need stop timer/ close voteCh?
 			return
 		case reply := <-voteCh:
-			// rf.mu.Lock() 刚犯了一个错误，在这里 lock，这个case的末尾unlock，没注意到返回！！！dead lock
 			if reply.VoteGranted == false {
 				rf.mu.Lock()
 				if reply.Term > rf.currentTerm {
 					rf.currentTerm = reply.Term
 					rf.votedFor = -1
 					rf.state = FOLLOWER
+					rf.persist()
 					rf.mu.Unlock()
 					// TODO: need stop timer/ close voteCh?
 					return
@@ -507,58 +545,51 @@ func (rf *Raft) enterCandidateState() {
 				}
 				rf.mu.Unlock()
 			}
-			// rf.mu.Unlock()
 		}
 	}
 }
 
 func (rf *Raft) enterLeaderState() {
 	rf.mu.Lock()
-	DPrintln("[STATE] [I'm]", rf.me, "[Term]", rf.currentTerm, "[enterLeaderState]")
+	// 在这个状态机里，这几个变量都不会改变
+	length := len(rf.peers)
+	me := rf.me
+	currentTerm := rf.currentTerm
+
+	for i := 0; i < length; i++ {
+		rf.nextIndex[i] = rf.lastApplied + 1
+		rf.matchIndex[i] = 0
+	}
 	rf.mu.Unlock()
+
+	// TODO: 要不要放在最前面
+	DPrintln("[STATE] [I'm]", me, "[Term]", currentTerm, "[enterLeaderState]")
 
 	// TODO: why "the tester limits you to 10 heartbeats per second" ?
 	const heartbeatInterval = 100 * time.Millisecond
 	ticker := time.NewTicker(heartbeatInterval)
 
-	rf.mu.Lock()
-	for i := 0; i < len(rf.nextIndex); i++ {
-		rf.nextIndex[i] = rf.lastApplied + 1
-		rf.matchIndex[i] = 0 // TODO: or -1 ?
-	}
-	rf.mu.Unlock()
-
 	for {
 		select {
 		case <-ticker.C:
-			rf.mu.Lock()
-			DPrintln("[Leader Send AppendEntries] [I'm]", rf.me, "[Term]", rf.currentTerm)
-			rf.mu.Unlock()
+			DPrintln("[Leader Send AppendEntries] [I'm]", me, "[Term]", currentTerm)
 
 			// TODO: 这个逻辑看能不能简化，太长了
 			// TODO: 执行到一半的时候，收到更高 term 的请求，怎么处理!!!
-			rf.mu.Lock()
-			length := len(rf.peers)
-			me := rf.me
-			rf.mu.Unlock()
-
 			for i := 0; i < length; i++ {
 				if i != me {
 					go func(index int) {
-						rf.mu.Lock()
-						currentTerm := rf.currentTerm
-						lastApplied := rf.lastApplied
-						rf.mu.Unlock()
-
 					SendAppendEntries:
 						rf.mu.Lock()
+						DPrintf("%+v\n", rf) // TODO: DEL
 						args := AppendEntriesArgs{
 							Term:         currentTerm,
-							LeaderID:     rf.me,
+							LeaderID:     me,
 							PrevLogIndex: rf.nextIndex[index] - 1,
 							PrevLogTerm:  rf.log[rf.nextIndex[index]-1].Term,
 							LeaderCommit: rf.commitIndex,
 						}
+						lastApplied := rf.lastApplied
 						if lastApplied+1 > rf.nextIndex[index] {
 							args.Entries = rf.log[rf.nextIndex[index] : lastApplied+1]
 						}
@@ -584,13 +615,16 @@ func (rf *Raft) enterLeaderState() {
 										if cnt == len(rf.peers)/2+1 && lastApplied > rf.commitIndex {
 											oldIndex := rf.commitIndex
 											rf.commitIndex = lastApplied
+											rf.persist()
 											go rf.apply(oldIndex, rf.commitIndex)
 										}
 									}
 								} else {
+									// DPrintf("[hahaha]%+v %+v\n", rf, reply) TODO: DEL
 									if reply.Term > rf.currentTerm {
 										rf.currentTerm = reply.Term
 										rf.votedFor = -1
+										rf.persist()
 										rf.tobeFollowerCh <- struct{}{}
 									} else {
 										rf.nextIndex[index] = rf.nextIndex[index] - 1
@@ -620,6 +654,7 @@ func (rf *Raft) enterLeaderState() {
 						if cnt == len(rf.peers)/2+1 && rf.lastApplied > rf.commitIndex {
 							oldIndex := rf.commitIndex
 							rf.commitIndex = rf.lastApplied
+							rf.persist()
 							go rf.apply(oldIndex, rf.commitIndex)
 						}
 					}
