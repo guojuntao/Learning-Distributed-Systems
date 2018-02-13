@@ -199,7 +199,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		(args.LastLogTerm == rf.log[rf.lastApplied].Term && args.LastLogIndex < rf.lastApplied) {
 
 		if args.Term > rf.currentTerm {
-			rf.currentTerm = args.Term //FIXBUG,should\add\tobeFollowerCh???TODO
+			rf.currentTerm = args.Term
 			rf.votedFor = -1
 			rf.tobeFollowerCh <- struct{}{}
 		}
@@ -413,7 +413,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		for i := oldIndex + 1; i <= newIndex; i++ {
 			applyCh <- ApplyMsg{
 				CommandValid: true,
-				Command:      log[i].Command,
+				Command:      log[i].Command, // TODO: -race 检测有问题
 				CommandIndex: i,
 			}
 		}
@@ -612,7 +612,7 @@ func (rf *Raft) enterLeaderState() {
 												cnt = cnt + 1
 											}
 										}
-										if cnt == len(rf.peers)/2+1 && lastApplied > rf.commitIndex {
+										if cnt == len(rf.peers)/2+1 && lastApplied > rf.commitIndex && rf.log[lastApplied].Term == rf.currentTerm {
 											oldIndex := rf.commitIndex
 											rf.commitIndex = lastApplied
 											rf.persist()
@@ -651,7 +651,7 @@ func (rf *Raft) enterLeaderState() {
 								cnt = cnt + 1
 							}
 						}
-						if cnt == len(rf.peers)/2+1 && rf.lastApplied > rf.commitIndex {
+						if cnt == len(rf.peers)/2+1 && rf.lastApplied > rf.commitIndex && rf.log[rf.lastApplied].Term == rf.currentTerm {
 							oldIndex := rf.commitIndex
 							rf.commitIndex = rf.lastApplied
 							rf.persist()
@@ -672,3 +672,5 @@ func (rf *Raft) enterLeaderState() {
 		}
 	}
 }
+
+// 为什么 raft 死锁了，test 就会卡住
