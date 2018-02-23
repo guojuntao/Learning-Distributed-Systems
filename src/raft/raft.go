@@ -123,7 +123,7 @@ func (rf *Raft) persist() {
 	// Your code here (2C).
 	// Example:
 
-	// 调用 rf.persist need call rf.mu.Lock() before
+	// should be called after rf.mu.Lock()
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	e.Encode(persistRaft{
@@ -141,13 +141,16 @@ func (rf *Raft) persist() {
 // restore previously persisted state.
 //
 func (rf *Raft) readPersist(data []byte) {
+	if data == nil || len(data) < 1 { // bootstrap without any state?
+		return
+	}
 	// Your code here (2C).
 	// Example:
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
 	var pRf persistRaft
 	if err := d.Decode(&pRf); err != nil {
-		DPrintln("decode error", err) // TODO
+		panic(err)
 	} else {
 		rf.mu.Lock()
 		DPrintf("[me]%d(%p) [readPersist]%+v\n", rf.me, rf, pRf)
@@ -157,9 +160,6 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.commitIndex = pRf.CommitIndex
 		rf.lastApplied = pRf.LastApplied
 		rf.mu.Unlock()
-	}
-	if data == nil || len(data) < 1 { // bootstrap without any state?
-		return
 	}
 }
 
@@ -587,7 +587,6 @@ func (rf *Raft) enterLeaderState() {
 		case <-ticker.C:
 			DPrintf("[Leader Send AppendEntries] [me]%d(%p) [currentTerm]%d\n", me, rf, currentTerm)
 
-			// TODO: 这个逻辑看能不能简化，太长了
 			// TODO: 执行到一半的时候，收到更高 term 的请求，怎么处理!!!
 			for i := 0; i < length; i++ {
 				if i != me {
@@ -612,70 +611,16 @@ func (rf *Raft) enterLeaderState() {
 
 						// TODO: if return false value, retry?
 						if ok := rf.sendAppendEntries(index, &args, &reply); ok {
-							rf.mu.Lock()
-							if rf.state == LEADER {
-								if reply.Success == true {
-									if rf.matchIndex[index] != lastApplied {
-										rf.nextIndex[index] = lastApplied + 1
-										rf.matchIndex[index] = lastApplied
-
-										cnt := 0
-										for _, idx := range rf.matchIndex {
-											if idx >= lastApplied {
-												cnt = cnt + 1
-											}
-										}
-										if cnt == len(rf.peers)/2+1 && lastApplied > rf.commitIndex && rf.log[lastApplied].Term == rf.currentTerm {
-											oldIndex := rf.commitIndex
-											rf.commitIndex = lastApplied
-											rf.persist()
-											go rf.apply(oldIndex, rf.commitIndex)
-										}
-									}
-								} else {
-									// DPrintf("[hahaha]%+v %+v\n", rf, reply) TODO: DEL
-									if reply.Term > rf.currentTerm {
-										rf.currentTerm = reply.Term
-										rf.votedFor = -1
-										rf.persist()
-										rf.tobeFollowerCh <- struct{}{}
-									} else {
-										rf.nextIndex[index] = rf.nextIndex[index] - 1
-										if rf.nextIndex[index] > reply.LastApplied {
-											rf.nextIndex[index] = reply.LastApplied + 1
-										}
-										if rf.nextIndex[index] < 1 { // add this for fix bug
-											rf.nextIndex[index] = 1
-										}
-										rf.mu.Unlock()
-										goto SendAppendEntries
-										// TODO: 有一种情况，需要重试 SendAppendEntries 次数太多
-										// 远超过 sendAppendEntries 间隔，会怎样
-									}
-								}
+							if rf.handleAppendEntriesReply(&reply, lastApplied, index) == true {
+								goto SendAppendEntries
+								// TODO: 有一种情况，需要重试 SendAppendEntries 次数太多
+								// 远超过 sendAppendEntries 间隔，会怎样
 							}
-							rf.mu.Unlock()
 						}
 					}(i)
 				} else {
 					rf.mu.Lock()
-					if rf.matchIndex[i] != rf.lastApplied {
-						rf.nextIndex[i] = rf.lastApplied + 1
-						rf.matchIndex[i] = rf.lastApplied
-
-						cnt := 0
-						for _, idx := range rf.matchIndex {
-							if idx >= rf.lastApplied {
-								cnt = cnt + 1
-							}
-						}
-						if cnt == len(rf.peers)/2+1 && rf.lastApplied > rf.commitIndex && rf.log[rf.lastApplied].Term == rf.currentTerm {
-							oldIndex := rf.commitIndex
-							rf.commitIndex = rf.lastApplied
-							rf.persist()
-							go rf.apply(oldIndex, rf.commitIndex)
-						}
-					}
+					rf.incMactchIndex(rf.lastApplied, rf.me)
 					rf.mu.Unlock()
 				}
 			}
@@ -699,4 +644,54 @@ func (rf *Raft) enterLeaderState() {
 	}
 }
 
-// 为什么 raft 死锁了，test 就会卡住
+func (rf *Raft) handleAppendEntriesReply(reply *AppendEntriesReply, lastApplied int,
+	index int) (retry bool) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if rf.state == LEADER {
+		if reply.Success == true {
+			rf.incMactchIndex(lastApplied, index)
+		} else {
+			if reply.Term > rf.currentTerm {
+				rf.currentTerm = reply.Term
+				rf.votedFor = -1
+				rf.persist()
+				rf.tobeFollowerCh <- struct{}{}
+			} else {
+				rf.nextIndex[index] = rf.nextIndex[index] - 1
+				if rf.nextIndex[index] > reply.LastApplied {
+					rf.nextIndex[index] = reply.LastApplied + 1
+				}
+				if rf.nextIndex[index] < 1 { // add this for fix bug
+					rf.nextIndex[index] = 1
+				}
+				return true
+			}
+		}
+	}
+	return retry
+}
+
+// should be called after rf.mu.Lock()
+func (rf *Raft) incMactchIndex(matchIndex int, index int) {
+	if rf.matchIndex[index] != matchIndex {
+		rf.nextIndex[index] = matchIndex + 1
+		rf.matchIndex[index] = matchIndex
+
+		cnt := 0
+		for _, idx := range rf.matchIndex {
+			if idx >= matchIndex {
+				cnt = cnt + 1
+			}
+		}
+		if cnt == len(rf.peers)/2+1 && matchIndex > rf.commitIndex && rf.log[matchIndex].Term == rf.currentTerm {
+			oldIndex := rf.commitIndex
+			rf.commitIndex = matchIndex
+			rf.persist()
+			go rf.apply(oldIndex, rf.commitIndex)
+		}
+	}
+}
+
+// TODO: 为什么 raft 死锁了，test 就会卡住
