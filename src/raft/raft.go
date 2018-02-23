@@ -2,6 +2,8 @@ package raft
 
 // TODO list
 // 3. stop timer & close voteCh
+// 4. 日志还需要进一步整理
+// 5. TestFigure8Unreliable2C 还没通过
 
 //
 // this is an outline of the API that raft must expose to
