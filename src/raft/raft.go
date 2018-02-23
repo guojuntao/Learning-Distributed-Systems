@@ -203,7 +203,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		if args.Term > rf.currentTerm {
 			rf.currentTerm = args.Term
 			rf.votedFor = -1
-			rf.tobeFollowerCh <- struct{}{}
+			go func() {
+				rf.tobeFollowerCh <- struct{}{}
+			}()
 		}
 		reply.VoteGranted = false
 		reply.Term = rf.currentTerm
@@ -211,7 +213,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	} else {
 		rf.currentTerm = args.Term
 		rf.votedFor = args.CandidateId
-		rf.tobeFollowerCh <- struct{}{}
+		go func() {
+			rf.tobeFollowerCh <- struct{}{}
+		}()
 
 		reply.VoteGranted = true
 		reply.Term = rf.currentTerm
@@ -289,7 +293,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
 	}
-	rf.tobeFollowerCh <- struct{}{}
+	go func() {
+		rf.tobeFollowerCh <- struct{}{}
+	}()
 	reply.Term = rf.currentTerm
 
 	if rf.lastApplied >= args.PrevLogIndex && args.PrevLogTerm == rf.log[args.PrevLogIndex].Term {
@@ -359,9 +365,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 //
 func (rf *Raft) Kill() {
 	// Your code here, if desired.
-	rf.mu.Lock()
-	rf.killCh <- struct{}{}
-	rf.mu.Unlock()
+	go func() {
+		rf.killCh <- struct{}{}
+	}()
 }
 
 //
@@ -394,8 +400,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.matchIndex = make([]int, len(rf.peers))
 
 	rf.state = FOLLOWER
-	rf.tobeFollowerCh = make(chan struct{}, 1)
-	rf.killCh = make(chan struct{}, 1)
+	rf.tobeFollowerCh = make(chan struct{})
+	rf.killCh = make(chan struct{})
 	rf.getRandTime = func() func() time.Duration {
 		const timeoutMax = 500 // 300
 		const timeoutMin = 250 // 150
@@ -657,7 +663,9 @@ func (rf *Raft) handleAppendEntriesReply(reply *AppendEntriesReply, lastApplied 
 				rf.currentTerm = reply.Term
 				rf.votedFor = -1
 				rf.persist()
-				rf.tobeFollowerCh <- struct{}{}
+				go func() {
+					rf.tobeFollowerCh <- struct{}{}
+				}()
 			} else {
 				rf.nextIndex[index] = rf.nextIndex[index] - 1
 				if rf.nextIndex[index] > reply.LastApplied {
