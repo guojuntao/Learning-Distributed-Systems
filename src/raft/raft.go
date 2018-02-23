@@ -417,12 +417,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	}()
 	rf.apply = func(oldIndex int, newIndex int) {
 		rf.mu.Lock()
-		log := rf.log
+		log := make([]Entry, len(rf.log))
+		copy(log, rf.log)
 		rf.mu.Unlock()
 		for i := oldIndex + 1; i <= newIndex; i++ {
 			applyCh <- ApplyMsg{
 				CommandValid: true,
-				Command:      log[i].Command, // TODO: -race 检测有问题
+				Command:      log[i].Command,
 				CommandIndex: i,
 			}
 		}
@@ -599,7 +600,7 @@ func (rf *Raft) enterLeaderState() {
 					go func(index int) {
 					SendAppendEntries:
 						rf.mu.Lock()
-						DPrintf("%+v\n", rf) // TODO: DEL
+						// DPrintf("%+v\n", rf) // TODO: DEL
 						args := AppendEntriesArgs{
 							Term:         currentTerm,
 							LeaderID:     me,
@@ -609,7 +610,8 @@ func (rf *Raft) enterLeaderState() {
 						}
 						lastApplied := rf.lastApplied
 						if lastApplied+1 > rf.nextIndex[index] {
-							args.Entries = rf.log[rf.nextIndex[index] : lastApplied+1]
+							args.Entries = make([]Entry, lastApplied+1-rf.nextIndex[index])
+							copy(args.Entries, rf.log[rf.nextIndex[index]:lastApplied+1])
 						}
 						rf.mu.Unlock()
 
