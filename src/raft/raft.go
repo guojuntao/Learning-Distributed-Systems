@@ -575,7 +575,7 @@ func (rf *Raft) enterCandidateState() {
 
 func (rf *Raft) enterLeaderState() {
 	rf.mu.Lock()
-	DPrintf("[enterLeaderState] [me]%d(%p) [currentTerm]%d\n", me, rf, currentTerm)
+	DPrintf("[enterLeaderState] [me]%d(%p) [currentTerm]%d\n", rf.me, rf, rf.currentTerm)
 
 	// 在这个状态机里，这几个变量都不会改变
 	length := len(rf.peers)
