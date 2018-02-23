@@ -4,6 +4,7 @@ package raft
 // 3. stop timer & close voteCh
 // 4. 日志还需要进一步整理
 // 5. TestFigure8Unreliable2C 还没通过
+// 6. reply.LastApplied 可以考虑删除
 
 //
 // this is an outline of the API that raft must expose to
@@ -419,14 +420,15 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	}()
 	rf.apply = func(oldIndex int, newIndex int) {
 		rf.mu.Lock()
-		log := make([]Entry, len(rf.log))
-		copy(log, rf.log)
+		log := make([]Entry, newIndex-oldIndex)
+		copy(log, rf.log[oldIndex+1:newIndex+1])
 		rf.mu.Unlock()
-		for i := oldIndex + 1; i <= newIndex; i++ {
+
+		for k, v := range log {
 			applyCh <- ApplyMsg{
 				CommandValid: true,
-				Command:      log[i].Command,
-				CommandIndex: i,
+				Command:      v.Command,
+				CommandIndex: oldIndex + 1 + k,
 			}
 		}
 	}
@@ -573,6 +575,8 @@ func (rf *Raft) enterCandidateState() {
 
 func (rf *Raft) enterLeaderState() {
 	rf.mu.Lock()
+	DPrintf("[enterLeaderState] [me]%d(%p) [currentTerm]%d\n", me, rf, currentTerm)
+
 	// 在这个状态机里，这几个变量都不会改变
 	length := len(rf.peers)
 	me := rf.me
@@ -583,9 +587,6 @@ func (rf *Raft) enterLeaderState() {
 		rf.matchIndex[i] = 0
 	}
 	rf.mu.Unlock()
-
-	// TODO: 要不要放在最前面
-	DPrintf("[enterLeaderState] [me]%d(%p) [currentTerm]%d\n", rf.me, rf, rf.currentTerm)
 
 	// TODO: why "the tester limits you to 10 heartbeats per second" ?
 	const heartbeatInterval = 100 * time.Millisecond
@@ -630,7 +631,7 @@ func (rf *Raft) enterLeaderState() {
 					}(i)
 				} else {
 					rf.mu.Lock()
-					rf.incMactchIndex(rf.lastApplied, rf.me)
+					rf.incMactchIndex(rf.lastApplied, me)
 					rf.mu.Unlock()
 				}
 			}
