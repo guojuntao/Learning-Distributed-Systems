@@ -51,6 +51,7 @@ const (
 	FOLLOWER state = iota
 	CANDIDATE
 	LEADER
+	KILLED // for the test to add
 )
 
 type Entry struct {
@@ -84,7 +85,7 @@ type Raft struct {
 	// add by myself
 	state          state
 	tobeFollowerCh chan struct{}
-	kill           bool
+	killCh         chan struct{}
 	getRandTime    func() time.Duration
 	apply          func(int, int)
 }
@@ -121,6 +122,7 @@ type persistRaft struct {
 func (rf *Raft) persist() {
 	// Your code here (2C).
 	// Example:
+
 	// 调用 rf.persist need call rf.mu.Lock() before
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
@@ -145,10 +147,10 @@ func (rf *Raft) readPersist(data []byte) {
 	d := labgob.NewDecoder(r)
 	var pRf persistRaft
 	if err := d.Decode(&pRf); err != nil {
-		DPrintln("decode error", err)
+		DPrintln("decode error", err) // TODO
 	} else {
 		rf.mu.Lock()
-		DPrintln("Im ", rf.me, "[readPersist]", pRf)
+		DPrintf("[me]%d(%p) [readPersist]%+v\n", rf.me, rf, pRf)
 		rf.currentTerm = pRf.CurrentTerm
 		rf.votedFor = pRf.VotedFor
 		rf.log = pRf.Log
@@ -191,7 +193,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	defer rf.persist()
-	// defer print
+	defer DPrintf("[RequestVote] [me]%d(%p) [currentTerm]%d [args]%+v [reply]%+v\n", rf.me, rf, rf.currentTerm, args, reply)
 
 	if args.Term < rf.currentTerm ||
 		(args.Term == rf.currentTerm && args.CandidateId != rf.votedFor && rf.votedFor != -1) ||
@@ -209,12 +211,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	} else {
 		rf.currentTerm = args.Term
 		rf.votedFor = args.CandidateId
-		rf.tobeFollowerCh <- struct{}{} // TODO: 会被阻塞吗?
+		rf.tobeFollowerCh <- struct{}{}
 
 		reply.VoteGranted = true
 		reply.Term = rf.currentTerm
 	}
-	DPrintf("[RequestVote] [I'm] %d [Term] %d, [Args]%+v [Reply]%+v\n", rf.me, rf.currentTerm, args, reply)
 	return
 }
 
@@ -266,13 +267,15 @@ type AppendEntriesReply struct {
 	// follow paper's Figure 2
 	Term    int
 	Success bool
+
+	LastApplied int // 当 success 为 false，为了让 leader 减少重试次数
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	defer rf.persist()
-	// defer print
+	defer DPrintf("[AppendEntries] [me]%d(%p) [currentTerm]%d [args]%+v [reply]%+v\n", rf.me, rf, rf.currentTerm, args, reply)
 
 	// if args.Term == rf.currentTerm && args.LeaderID != rf.votedFor
 	// then 不改变 votedFor, 同时返回 success = true，这种场景要思考一下 TODO
@@ -302,9 +305,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Success = true
 	} else {
 		reply.Success = false
+		reply.LastApplied = rf.lastApplied
 	}
-
-	DPrintf("[AppendEntries] [I'm] %d [Term] %d, [Args]%+v [Reply]%+v\n", rf.me, rf.currentTerm, args, reply)
 	return
 }
 
@@ -339,7 +341,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	if rf.state != LEADER {
 		isLeader = false
 	} else {
-		DPrintln("[In start] [I'm]", rf.me, "[Term]", rf.currentTerm, "[command]", command)
+		DPrintf("[Start] [me]%d(%p) [currentTerm]%d [command]%v\n", rf.me, rf, rf.currentTerm, command)
 		rf.lastApplied = rf.lastApplied + 1
 		rf.log = append(rf.log, Entry{rf.currentTerm, command})
 
@@ -358,7 +360,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	// Your code here, if desired.
 	rf.mu.Lock()
-	rf.kill = true
+	rf.killCh <- struct{}{}
 	rf.mu.Unlock()
 }
 
@@ -393,6 +395,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	rf.state = FOLLOWER
 	rf.tobeFollowerCh = make(chan struct{}, 1)
+	rf.killCh = make(chan struct{}, 1)
 	rf.getRandTime = func() func() time.Duration {
 		const timeoutMax = 500 // 300
 		const timeoutMin = 250 // 150
@@ -425,9 +428,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// state machine
 	go func() {
 		for {
-			if rf.kill == true {
-				return
-			}
 			switch rf.state {
 			case FOLLOWER:
 				rf.enterFollowerState()
@@ -435,6 +435,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 				rf.enterCandidateState()
 			case LEADER:
 				rf.enterLeaderState()
+			case KILLED:
+				DPrintf("[enterKillState] [me]%d(%p)\n", rf.me, rf)
+				return
 			default:
 				panic(fmt.Sprintln("Unknown state ", rf.state))
 			}
@@ -446,7 +449,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 func (rf *Raft) enterFollowerState() {
 	rf.mu.Lock()
-	DPrintln("[STATE] [I'm]", rf.me, "[Term]", rf.currentTerm, "[enterFollowerState]")
+	DPrintf("[enterFollowerState] [me]%d(%p) [currentTerm]%d\n", rf.me, rf, rf.currentTerm)
 	rf.mu.Unlock()
 
 	timer := time.NewTimer(rf.getRandTime())
@@ -463,13 +466,18 @@ func (rf *Raft) enterFollowerState() {
 				<-timer.C
 			}
 			timer.Reset(rf.getRandTime())
+		case <-rf.killCh:
+			rf.mu.Lock()
+			rf.state = KILLED
+			rf.mu.Unlock()
+			return
 		}
 	}
 }
 
 func (rf *Raft) enterCandidateState() {
 	rf.mu.Lock()
-	DPrintln("[STATE] [I'm]", rf.me, "[Term]", rf.currentTerm+1, "[enterCandidateState]")
+	DPrintf("[enterCandidateState] [me]%d(%p) [currentTerm]%d\n", rf.me, rf, rf.currentTerm+1)
 	rf.mu.Unlock()
 
 	rf.mu.Lock()
@@ -483,7 +491,7 @@ func (rf *Raft) enterCandidateState() {
 	voteCh := make(chan RequestVoteReply, len(rf.peers))
 
 	rf.mu.Lock()
-	DPrintln("[Candidate Send RequestVote] [I'm]", rf.me, "[Term]", rf.currentTerm)
+	DPrintf("[Candidate Send RequestVote] [me]%d(%p) [currentTerm]%d\n", rf.me, rf, rf.currentTerm)
 	rf.mu.Unlock()
 
 	rf.mu.Lock()
@@ -545,6 +553,11 @@ func (rf *Raft) enterCandidateState() {
 				}
 				rf.mu.Unlock()
 			}
+		case <-rf.killCh:
+			rf.mu.Lock()
+			rf.state = KILLED
+			rf.mu.Unlock()
+			return
 		}
 	}
 }
@@ -563,7 +576,7 @@ func (rf *Raft) enterLeaderState() {
 	rf.mu.Unlock()
 
 	// TODO: 要不要放在最前面
-	DPrintln("[STATE] [I'm]", me, "[Term]", currentTerm, "[enterLeaderState]")
+	DPrintf("[enterLeaderState] [me]%d(%p) [currentTerm]%d\n", rf.me, rf, rf.currentTerm)
 
 	// TODO: why "the tester limits you to 10 heartbeats per second" ?
 	const heartbeatInterval = 100 * time.Millisecond
@@ -572,7 +585,7 @@ func (rf *Raft) enterLeaderState() {
 	for {
 		select {
 		case <-ticker.C:
-			DPrintln("[Leader Send AppendEntries] [I'm]", me, "[Term]", currentTerm)
+			DPrintf("[Leader Send AppendEntries] [me]%d(%p) [currentTerm]%d\n", me, rf, currentTerm)
 
 			// TODO: 这个逻辑看能不能简化，太长了
 			// TODO: 执行到一半的时候，收到更高 term 的请求，怎么处理!!!
@@ -628,11 +641,16 @@ func (rf *Raft) enterLeaderState() {
 										rf.tobeFollowerCh <- struct{}{}
 									} else {
 										rf.nextIndex[index] = rf.nextIndex[index] - 1
-										if rf.nextIndex[index] < 1 { // fix bug
+										if rf.nextIndex[index] > reply.LastApplied {
+											rf.nextIndex[index] = reply.LastApplied + 1
+										}
+										if rf.nextIndex[index] < 1 { // add this for fix bug
 											rf.nextIndex[index] = 1
 										}
 										rf.mu.Unlock()
 										goto SendAppendEntries
+										// TODO: 有一种情况，需要重试 SendAppendEntries 次数太多
+										// 远超过 sendAppendEntries 间隔，会怎样
 									}
 								}
 							}
@@ -665,6 +683,14 @@ func (rf *Raft) enterLeaderState() {
 		case <-rf.tobeFollowerCh:
 			rf.mu.Lock()
 			rf.state = FOLLOWER
+			rf.mu.Unlock()
+			// TODO: need stop ticker?
+			ticker.Stop()
+			return
+
+		case <-rf.killCh:
+			rf.mu.Lock()
+			rf.state = KILLED
 			rf.mu.Unlock()
 			// TODO: need stop ticker?
 			ticker.Stop()
