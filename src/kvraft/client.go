@@ -4,10 +4,11 @@ import "labrpc"
 import "crypto/rand"
 import "math/big"
 
-
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
+	// lock ?
+	leaderIndex int
 }
 
 func nrand() int64 {
@@ -38,6 +39,17 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 //
 func (ck *Clerk) Get(key string) string {
 
+	args := GetArgs{key}
+	// for i := 0; i < len(ck.servers); i++ {
+	for {
+		reply := GetReply{}
+		_ = ck.servers[ck.leaderIndex].Call("RaftKV.Get", &args, &reply)
+		if reply.WrongLeader == false {
+			return reply.Value // ignore reply.Err ?
+		}
+		ck.leaderIndex = (ck.leaderIndex + 1) % len(ck.servers)
+	}
+
 	// You will have to modify this function.
 	return ""
 }
@@ -54,6 +66,17 @@ func (ck *Clerk) Get(key string) string {
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
+	args := PutAppendArgs{key, value, op}
+	// for i := 0; i < len(ck.servers); i++ {
+	for {
+		reply := PutAppendReply{}
+		_ = ck.servers[ck.leaderIndex].Call("RaftKV.PutAppend", &args, &reply)
+		if reply.WrongLeader == false {
+			return // ignore reply.Err ?
+		}
+		ck.leaderIndex = (ck.leaderIndex + 1) % len(ck.servers)
+	}
+	return
 }
 
 func (ck *Clerk) Put(key string, value string) {

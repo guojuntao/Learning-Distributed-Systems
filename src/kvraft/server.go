@@ -17,11 +17,24 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
-
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Key   string
+	Value string
+	Op    string // "Put" or "Append" or "Get"
+}
+
+type noticeChKey struct {
+	index int
+	term  int
+}
+
+type noticeChValue struct {
+	succ  bool
+	value string
+	err   Err
 }
 
 type RaftKV struct {
@@ -33,15 +46,91 @@ type RaftKV struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	store     map[string]string
+	noticeChs map[noticeChKey]chan noticeChValue // TODO release
 }
-
 
 func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+	index, term, isLeader := kv.rf.Start(Op{args.Key, "", "Get"})
+	if isLeader == false {
+		reply.WrongLeader = true
+		return
+	}
+	rCh := make(chan noticeChValue, 1) // 非同步 chan
+	kv.noticeChs[noticeChKey{index, term}] = rCh
+	r := <-rCh
+	DPrintf("Get %+v", r)
+	if r.succ == true {
+		reply.WrongLeader = false
+		reply.Err = OK
+		reply.Value = r.value
+	} else {
+		reply.WrongLeader = false
+		reply.Err = r.err
+	}
+	return
 }
 
 func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	index, term, isLeader := kv.rf.Start(Op{args.Key, args.Value, args.Op})
+	if isLeader == false {
+		reply.WrongLeader = true
+		// reply.Err = nil
+		return
+	}
+	rCh := make(chan noticeChValue, 1) // 非同步 chan
+	kv.noticeChs[noticeChKey{index, term}] = rCh
+	r := <-rCh
+	DPrintf("PutAppend %+v", r)
+	if r.succ == true {
+		reply.WrongLeader = false
+		reply.Err = OK
+	} else {
+		reply.WrongLeader = false
+		reply.Err = r.err
+	}
+	return
+}
+
+func (kv *RaftKV) recvApplyMsg() {
+	for {
+		applyMsg := <-kv.applyCh
+		DPrintf("%+v", applyMsg)
+		// applyMsg.CommandValid
+		command := applyMsg.Command
+		index := applyMsg.CommandIndex
+
+		kv.mu.Lock()
+		term, _ := kv.rf.GetState()
+		if op, ok := command.(Op); ok {
+			switch op.Op {
+			case "Put":
+				kv.store[op.Key] = op.Value
+				key := noticeChKey{index, term}
+				kv.noticeChs[key] <- noticeChValue{true, "", OK}
+			case "Append":
+				if original, ok := kv.store[op.Key]; ok {
+					kv.store[op.Key] = original + op.Value
+				} else {
+					kv.store[op.Key] = op.Value
+				}
+				key := noticeChKey{index, term}
+				kv.noticeChs[key] <- noticeChValue{true, "", OK}
+			case "Get":
+				key := noticeChKey{index, term}
+				if value, ok := kv.store[op.Key]; ok {
+					kv.noticeChs[key] <- noticeChValue{true, value, OK}
+				} else {
+					kv.noticeChs[key] <- noticeChValue{true, value, ErrNoKey}
+				}
+			default:
+				// error
+			}
+		}
+		kv.mu.Unlock()
+	}
 }
 
 //
@@ -83,6 +172,10 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
+	kv.store = make(map[string]string)
+	kv.noticeChs = make(map[noticeChKey]chan noticeChValue)
+
+	go kv.recvApplyMsg()
 
 	return kv
 }
