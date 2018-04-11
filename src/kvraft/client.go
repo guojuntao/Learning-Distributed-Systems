@@ -9,6 +9,8 @@ type Clerk struct {
 	// You will have to modify this struct.
 	// lock ?
 	leaderIndex int
+	reqID       int64
+	clerkID     int64
 }
 
 func nrand() int64 {
@@ -22,6 +24,8 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// You'll have to add code here.
+	ck.reqID = nrand()
+	ck.clerkID = nrand()
 	return ck
 }
 
@@ -38,13 +42,14 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 // arguments. and reply must be passed as a pointer.
 //
 func (ck *Clerk) Get(key string) string {
-
-	args := GetArgs{key}
+	ck.reqID = ck.reqID + 1
+	args := GetArgs{key, ck.clerkID, ck.reqID}
 	// for i := 0; i < len(ck.servers); i++ {
 	for {
 		reply := GetReply{}
-		_ = ck.servers[ck.leaderIndex].Call("RaftKV.Get", &args, &reply)
-		if reply.WrongLeader == false {
+		ok := ck.servers[ck.leaderIndex].Call("RaftKV.Get", &args, &reply)
+		DPrintf("Get reply %d %+v %+v", ck.leaderIndex, args, reply)
+		if ok && reply.WrongLeader == false {
 			return reply.Value // ignore reply.Err ?
 		}
 		ck.leaderIndex = (ck.leaderIndex + 1) % len(ck.servers)
@@ -66,12 +71,14 @@ func (ck *Clerk) Get(key string) string {
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
-	args := PutAppendArgs{key, value, op}
+	ck.reqID = ck.reqID + 1 // 不同 clerk 区分？lock?
+	args := PutAppendArgs{key, value, op, ck.clerkID, ck.reqID}
 	// for i := 0; i < len(ck.servers); i++ {
 	for {
 		reply := PutAppendReply{}
-		_ = ck.servers[ck.leaderIndex].Call("RaftKV.PutAppend", &args, &reply)
-		if reply.WrongLeader == false {
+		ok := ck.servers[ck.leaderIndex].Call("RaftKV.PutAppend", &args, &reply)
+		DPrintf("PutAppend reply %d %+v %+v %v", ck.leaderIndex, args, reply, ok)
+		if ok && reply.WrongLeader == false {
 			return // ignore reply.Err ?
 		}
 		ck.leaderIndex = (ck.leaderIndex + 1) % len(ck.servers)

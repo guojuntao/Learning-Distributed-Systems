@@ -8,7 +8,7 @@ import (
 	"sync"
 )
 
-const Debug = 0
+const Debug = 1
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
@@ -24,6 +24,10 @@ type Op struct {
 	Key   string
 	Value string
 	Op    string // "Put" or "Append" or "Get"
+
+	// duplicate detection
+	ClerkID int64
+	ReqID   int64
 }
 
 type noticeChKey struct {
@@ -48,18 +52,20 @@ type RaftKV struct {
 	// Your definitions here.
 	store     map[string]string
 	noticeChs map[noticeChKey]chan noticeChValue // TODO release
+	dplDtc    map[int64]int64                    // duplicate detection
 }
 
 func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
-	index, term, isLeader := kv.rf.Start(Op{args.Key, "", "Get"})
+	DPrintf("[Enter Get] %+v %+v", args, reply)
+	index, term, isLeader := kv.rf.Start(Op{args.Key, "", "Get", args.ClerkID, args.ReqID})
 	if isLeader == false {
 		reply.WrongLeader = true
 		return
 	}
 	rCh := make(chan noticeChValue, 1) // 非同步 chan
 	kv.noticeChs[noticeChKey{index, term}] = rCh
-	r := <-rCh
+	r := <-rCh // TODO 添加超时回复, labrpc 本身有超时机制，这里考虑超时回收 chan
 	DPrintf("Get %+v", r)
 	if r.succ == true {
 		reply.WrongLeader = false
@@ -74,7 +80,8 @@ func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
 
 func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
-	index, term, isLeader := kv.rf.Start(Op{args.Key, args.Value, args.Op})
+	DPrintf("[Enter PutAppend] %+v %+v %p", args, reply, args)
+	index, term, isLeader := kv.rf.Start(Op{args.Key, args.Value, args.Op, args.ClerkID, args.ReqID})
 	if isLeader == false {
 		reply.WrongLeader = true
 		// reply.Err = nil
@@ -83,7 +90,7 @@ func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	rCh := make(chan noticeChValue, 1) // 非同步 chan
 	kv.noticeChs[noticeChKey{index, term}] = rCh
 	r := <-rCh
-	DPrintf("PutAppend %+v", r)
+	DPrintf("PutAppend rCh %+v", r)
 	if r.succ == true {
 		reply.WrongLeader = false
 		reply.Err = OK
@@ -105,6 +112,15 @@ func (kv *RaftKV) recvApplyMsg() {
 		kv.mu.Lock()
 		term, _ := kv.rf.GetState()
 		if op, ok := command.(Op); ok {
+			reqID := kv.dplDtc[op.ClerkID]
+			// 这样简单处理有问题吗？依赖顺序 TODO
+			// cycle? 0
+			if reqID >= op.ReqID {
+				kv.mu.Unlock()
+				return
+			}
+			kv.dplDtc[op.ClerkID] = op.ReqID
+			// get ?
 			switch op.Op {
 			case "Put":
 				kv.store[op.Key] = op.Value
@@ -174,8 +190,30 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	// You may need initialization code here.
 	kv.store = make(map[string]string)
 	kv.noticeChs = make(map[noticeChKey]chan noticeChValue)
+	kv.dplDtc = make(map[int64]int64)
 
 	go kv.recvApplyMsg()
 
 	return kv
 }
+
+/*
+
+append(key, value)
+
+leader loss leadership
+
+wait
+
+									newleader
+
+									get(key)
+timeout
+
+clerk retry
+
+
+
+这种场景下，get 跟 append ,谁在 raft log 前面
+
+*/
