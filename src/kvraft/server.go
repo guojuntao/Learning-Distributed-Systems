@@ -6,6 +6,7 @@ import (
 	"log"
 	"raft"
 	"sync"
+	"time"
 )
 
 const Debug = 1
@@ -57,7 +58,7 @@ type RaftKV struct {
 
 func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
-	DPrintf("[Enter Get] %+v %+v", args, reply)
+	DPrintf("[Server Get function] %+v", args)
 	index, term, isLeader := kv.rf.Start(Op{args.Key, "", "Get", args.ClerkID, args.ReqID})
 	if isLeader == false {
 		reply.WrongLeader = true
@@ -65,22 +66,28 @@ func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
 	}
 	rCh := make(chan noticeChValue, 1) // 非同步 chan
 	kv.noticeChs[noticeChKey{index, term}] = rCh
-	r := <-rCh // TODO 添加超时回复, labrpc 本身有超时机制，这里考虑超时回收 chan
-	DPrintf("Get %+v", r)
-	if r.succ == true {
-		reply.WrongLeader = false
-		reply.Err = OK
-		reply.Value = r.value
-	} else {
-		reply.WrongLeader = false
-		reply.Err = r.err
+	select {
+	case r := <-rCh: // TODO 添加超时回复, labrpc 本身有超时机制，这里考虑超时回收 chan
+		DPrintf("[Server Get rCh] %+v", r)
+		if r.succ == true {
+			reply.WrongLeader = false
+			reply.Err = OK
+			reply.Value = r.value
+		} else {
+			reply.WrongLeader = false
+			reply.Err = r.err
+		}
+		close(rCh)
+	case <-time.After(time.Millisecond * 100):
+		reply.Err = "timeout" // TODO: timeout 时间多少比较合适
+		// close(rCh)
 	}
 	return
 }
 
 func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
-	DPrintf("[Enter PutAppend] %+v %+v %p", args, reply, args)
+	DPrintf("[Server PutAppend function] %+v", args)
 	index, term, isLeader := kv.rf.Start(Op{args.Key, args.Value, args.Op, args.ClerkID, args.ReqID})
 	if isLeader == false {
 		reply.WrongLeader = true
@@ -89,61 +96,101 @@ func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	}
 	rCh := make(chan noticeChValue, 1) // 非同步 chan
 	kv.noticeChs[noticeChKey{index, term}] = rCh
-	r := <-rCh
-	DPrintf("PutAppend rCh %+v", r)
-	if r.succ == true {
-		reply.WrongLeader = false
-		reply.Err = OK
-	} else {
-		reply.WrongLeader = false
-		reply.Err = r.err
+	select {
+	case r := <-rCh:
+		DPrintf("[Server PutAppend rCh] %+v", r)
+		if r.succ == true {
+			reply.WrongLeader = false
+			reply.Err = OK
+		} else {
+			reply.WrongLeader = false
+			reply.Err = r.err
+		}
+		close(rCh)
+	case <-time.After(time.Millisecond * 100): // TODO 什么情况下会发生？start 的 log 没有 commit
+		reply.Err = "timeout" // TODO: timeout 时间多少比较合适
+		// close(rCh)
 	}
 	return
 }
 
+// ！！！ BUG
+// 这里的方案有问题，在 leader 切换的时候
+// kv.noticeChs 的 chan，只有在 leader 的时候才会建立
+// 如果一个请求过来，raft[i] 是leader，提交之后，recvApplyMsg 之前，leader 转换
+// 新 leader 的 kv.noticeChs[key] 为 nil，阻塞
+// 导致异常
 func (kv *RaftKV) recvApplyMsg() {
 	for {
 		applyMsg := <-kv.applyCh
-		DPrintf("%+v", applyMsg)
+		DPrintf("[Server recvApplyMsg] %p %+v %+v", kv.rf, applyMsg, applyMsg.Command)
 		// applyMsg.CommandValid
 		command := applyMsg.Command
 		index := applyMsg.CommandIndex
 
 		kv.mu.Lock()
-		term, _ := kv.rf.GetState()
+		term, isleader := kv.rf.GetState()
 		if op, ok := command.(Op); ok {
 			reqID := kv.dplDtc[op.ClerkID]
 			// 这样简单处理有问题吗？依赖顺序 TODO
-			// cycle? 0
+			// && reqID cycle? 0
+			dup := false
 			if reqID >= op.ReqID {
-				kv.mu.Unlock()
-				return
+				dup = true
+			} else { // reqID < op.ReqID
+				kv.dplDtc[op.ClerkID] = op.ReqID
 			}
-			kv.dplDtc[op.ClerkID] = op.ReqID
 			// get ?
 			switch op.Op {
 			case "Put":
-				kv.store[op.Key] = op.Value
-				key := noticeChKey{index, term}
-				kv.noticeChs[key] <- noticeChValue{true, "", OK}
-			case "Append":
-				if original, ok := kv.store[op.Key]; ok {
-					kv.store[op.Key] = original + op.Value
-				} else {
+				if dup != true {
 					kv.store[op.Key] = op.Value
 				}
-				key := noticeChKey{index, term}
-				kv.noticeChs[key] <- noticeChValue{true, "", OK}
+				if isleader {
+					key := noticeChKey{index, term}
+					DPrintf("keykeykey %+v %v", key, kv.noticeChs[key])
+					if dup != true {
+						kv.noticeChs[key] <- noticeChValue{true, "", OK}
+					} else {
+						kv.noticeChs[key] <- noticeChValue{true, "", Dup}
+					}
+					DPrintf("yekyekyek %+v", key)
+				}
+			case "Append":
+				if dup != true {
+					if original, ok := kv.store[op.Key]; ok {
+						kv.store[op.Key] = original + op.Value
+					} else {
+						kv.store[op.Key] = op.Value
+					}
+				}
+				if isleader {
+					key := noticeChKey{index, term}
+					DPrintf("keykeykey %+v %v", key, kv.noticeChs[key])
+					if dup != true {
+						kv.noticeChs[key] <- noticeChValue{true, "", OK}
+					} else {
+						kv.noticeChs[key] <- noticeChValue{true, "", Dup}
+					}
+					DPrintf("yekyekyek %+v", key)
+				}
 			case "Get":
-				key := noticeChKey{index, term}
-				if value, ok := kv.store[op.Key]; ok {
-					kv.noticeChs[key] <- noticeChValue{true, value, OK}
-				} else {
-					kv.noticeChs[key] <- noticeChValue{true, value, ErrNoKey}
+				if isleader {
+					key := noticeChKey{index, term}
+					DPrintf("keykeykey %+v %v", key, kv.noticeChs[key])
+					if value, ok := kv.store[op.Key]; ok {
+						kv.noticeChs[key] <- noticeChValue{true, value, OK}
+					} else {
+						kv.noticeChs[key] <- noticeChValue{true, value, ErrNoKey}
+					}
+					DPrintf("yekyekyek %+v", key)
 				}
 			default:
+				DPrintf("xxxxxxxxx err op %v", op)
 				// error
 			}
+		} else {
+			DPrintf("xxxxxxxxx err op %v", op)
 		}
 		kv.mu.Unlock()
 	}
