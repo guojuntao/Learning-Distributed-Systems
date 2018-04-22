@@ -77,10 +77,8 @@ func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
 			reply.WrongLeader = false
 			reply.Err = r.err
 		}
-		close(rCh)
-	case <-time.After(time.Millisecond * 100):
+	case <-time.After(time.Millisecond * 1000):
 		reply.Err = "timeout" // TODO: timeout 时间多少比较合适
-		// close(rCh)
 	}
 	return
 }
@@ -106,30 +104,21 @@ func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 			reply.WrongLeader = false
 			reply.Err = r.err
 		}
-		close(rCh)
-	case <-time.After(time.Millisecond * 100): // TODO 什么情况下会发生？start 的 log 没有 commit
+	case <-time.After(time.Millisecond * 1000): // TODO 什么情况下会发生？start 的 log 没有 commit
 		reply.Err = "timeout" // TODO: timeout 时间多少比较合适
-		// close(rCh)
 	}
 	return
 }
 
-// ！！！ BUG
-// 这里的方案有问题，在 leader 切换的时候
-// kv.noticeChs 的 chan，只有在 leader 的时候才会建立
-// 如果一个请求过来，raft[i] 是leader，提交之后，recvApplyMsg 之前，leader 转换
-// 新 leader 的 kv.noticeChs[key] 为 nil，阻塞
-// 导致异常
 func (kv *RaftKV) recvApplyMsg() {
-	for {
-		applyMsg := <-kv.applyCh
+	for applyMsg := range kv.applyCh {
 		DPrintf("[Server recvApplyMsg] %p %+v %+v", kv.rf, applyMsg, applyMsg.Command)
 		// applyMsg.CommandValid
 		command := applyMsg.Command
 		index := applyMsg.CommandIndex
 
 		kv.mu.Lock()
-		term, isleader := kv.rf.GetState()
+		term, _ := kv.rf.GetState()
 		if op, ok := command.(Op); ok {
 			reqID := kv.dplDtc[op.ClerkID]
 			// 这样简单处理有问题吗？依赖顺序 TODO
@@ -140,21 +129,20 @@ func (kv *RaftKV) recvApplyMsg() {
 			} else { // reqID < op.ReqID
 				kv.dplDtc[op.ClerkID] = op.ReqID
 			}
-			// get ?
+
 			switch op.Op {
 			case "Put":
 				if dup != true {
 					kv.store[op.Key] = op.Value
 				}
-				if isleader {
-					key := noticeChKey{index, term}
-					DPrintf("keykeykey %+v %v", key, kv.noticeChs[key])
+				key := noticeChKey{index, term}
+				if kv.noticeChs[key] != nil {
 					if dup != true {
 						kv.noticeChs[key] <- noticeChValue{true, "", OK}
 					} else {
 						kv.noticeChs[key] <- noticeChValue{true, "", Dup}
 					}
-					DPrintf("yekyekyek %+v", key)
+					close(kv.noticeChs[key])
 				}
 			case "Append":
 				if dup != true {
@@ -164,26 +152,24 @@ func (kv *RaftKV) recvApplyMsg() {
 						kv.store[op.Key] = op.Value
 					}
 				}
-				if isleader {
-					key := noticeChKey{index, term}
-					DPrintf("keykeykey %+v %v", key, kv.noticeChs[key])
+				key := noticeChKey{index, term}
+				if kv.noticeChs[key] != nil {
 					if dup != true {
 						kv.noticeChs[key] <- noticeChValue{true, "", OK}
 					} else {
 						kv.noticeChs[key] <- noticeChValue{true, "", Dup}
 					}
-					DPrintf("yekyekyek %+v", key)
+					close(kv.noticeChs[key])
 				}
 			case "Get":
-				if isleader {
-					key := noticeChKey{index, term}
-					DPrintf("keykeykey %+v %v", key, kv.noticeChs[key])
+				key := noticeChKey{index, term}
+				if kv.noticeChs[key] != nil {
 					if value, ok := kv.store[op.Key]; ok {
 						kv.noticeChs[key] <- noticeChValue{true, value, OK}
 					} else {
 						kv.noticeChs[key] <- noticeChValue{true, value, ErrNoKey}
 					}
-					DPrintf("yekyekyek %+v", key)
+					close(kv.noticeChs[key])
 				}
 			default:
 				DPrintf("xxxxxxxxx err op %v", op)
