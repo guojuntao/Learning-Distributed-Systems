@@ -78,7 +78,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		reply := PutAppendReply{}
 		ok := ck.servers[ck.leaderIndex].Call("RaftKV.PutAppend", &args, &reply)
 		DPrintf("[Client PutAppend reply] %d %+v %+v %v", ck.leaderIndex, args, reply, ok)
-		if ok && reply.WrongLeader == false {
+		if ok && reply.WrongLeader == false && reply.Err != "timeout" {
 			return // ignore reply.Err ?
 		}
 		ck.leaderIndex = (ck.leaderIndex + 1) % len(ck.servers)
