@@ -1,6 +1,7 @@
 package raftkv
 
 import (
+	"bytes"
 	"labgob"
 	"labrpc"
 	"log"
@@ -9,7 +10,7 @@ import (
 	"time"
 )
 
-const Debug = 1
+const Debug = 0
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
@@ -52,7 +53,7 @@ type RaftKV struct {
 
 	// Your definitions here.
 	store     map[string]string
-	noticeChs map[noticeChKey]chan noticeChValue // TODO release
+	noticeChs map[noticeChKey]chan noticeChValue // TODO release, nil
 	dplDtc    map[int64]int64                    // duplicate detection
 }
 
@@ -67,7 +68,7 @@ func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
 	rCh := make(chan noticeChValue, 1) // 非同步 chan
 	kv.noticeChs[noticeChKey{index, term}] = rCh
 	select {
-	case r := <-rCh: // TODO 添加超时回复, labrpc 本身有超时机制，这里考虑超时回收 chan
+	case r := <-rCh:
 		DPrintf("[Server Get rCh] %+v", r)
 		if r.succ == true {
 			reply.WrongLeader = false
@@ -117,7 +118,7 @@ func (kv *RaftKV) recvApplyMsg() {
 		command := applyMsg.Command
 		index := applyMsg.CommandIndex
 
-		kv.mu.Lock()
+		kv.mu.Lock() // need ? TODO
 		term, _ := kv.rf.GetState()
 		if op, ok := command.(Op); ok {
 			reqID := kv.dplDtc[op.ClerkID]
@@ -225,9 +226,64 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.noticeChs = make(map[noticeChKey]chan noticeChValue)
 	kv.dplDtc = make(map[int64]int64)
 
+	kv.readPersist(persister.ReadRaftState())
+
 	go kv.recvApplyMsg()
 
 	return kv
+}
+
+type persistRaft struct {
+	Log         []raft.Entry
+	CommitIndex int
+}
+
+func (kv *RaftKV) readPersist(data []byte) {
+	if data == nil || len(data) < 1 { // bootstrap without any state?
+		return
+	}
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var pRf persistRaft
+	if err := d.Decode(&pRf); err != nil {
+		panic(err)
+	} else {
+		DPrintf("[kv raft readPersist] %+v\n", pRf)
+		log := pRf.Log
+		for i := 1; i <= pRf.CommitIndex; i++ {
+			entry := log[i]
+			command := entry.Command
+			if op, ok := command.(Op); ok {
+				reqID := kv.dplDtc[op.ClerkID]
+				dup := false
+				if reqID >= op.ReqID {
+					dup = true
+				} else { // reqID < op.ReqID
+					kv.dplDtc[op.ClerkID] = op.ReqID
+				}
+
+				switch op.Op {
+				case "Put":
+					if dup != true {
+						kv.store[op.Key] = op.Value
+					}
+				case "Append":
+					if dup != true {
+						if original, ok := kv.store[op.Key]; ok {
+							kv.store[op.Key] = original + op.Value
+						} else {
+							kv.store[op.Key] = op.Value
+						}
+					}
+				default:
+					DPrintf("xxxxxxxxx err op %v", op)
+					// error
+				}
+			} else {
+				DPrintf("xxxxxxxxx err op %v", op)
+			}
+		}
+	}
 }
 
 /*
