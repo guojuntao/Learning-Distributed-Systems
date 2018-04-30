@@ -2,20 +2,27 @@ package raft
 
 import "log"
 
-// TODO: 日志分类型控制打印
+const debugLevel = 0x0000
 
-// Debugging
-const Debug = 0
+const rpcRecvLog = 0x0001
+const candidateSendLog = 0x0002
+const leaderSendLog = 0x0004
 
-func DPrintf(format string, a ...interface{}) (n int, err error) {
-	if Debug > 0 {
+const persistLog = 0x0010
+const startLog = 0x0020
+const stateLog = 0x0040
+
+const getRandTimeLog = 0x0100
+
+func DPrintf(level uint, format string, a ...interface{}) (n int, err error) {
+	if debugLevel&level != 0 {
 		log.Printf(format, a...)
 	}
 	return
 }
 
-func DPrintln(a ...interface{}) (n int, err error) {
-	if Debug > 0 {
+func DPrintln(level uint, a ...interface{}) (n int, err error) {
+	if debugLevel&level != 0 {
 		log.Println(a...)
 	}
 	return
