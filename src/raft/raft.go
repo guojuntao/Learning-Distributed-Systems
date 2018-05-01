@@ -5,6 +5,7 @@ package raft
 // 4. 日志还需要进一步整理
 // 5. TestFigure8Unreliable2C 还没通过
 // 7. rf.lastApplied 理解错了，修正！！！
+// 8. -race
 
 //
 // this is an outline of the API that raft must expose to
@@ -93,10 +94,10 @@ type Raft struct {
 	tobeFollowerCh chan struct{}
 	killCh         chan struct{}
 	getRandTime    func() time.Duration
-	apply          func(int, int)
+	applyCh        chan ApplyMsg
 
 	// 防止 sendAppendEntriesWrapper 重入
-	sendingAppendEntries []bool
+	// sendingAppendEntries []bool
 }
 
 // return currentTerm and whether this server
@@ -286,6 +287,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // the struct itself.
 //
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
+	DPrintf(rpcSendLog,
+		"[sendingRequestVote] [me]%d(%p) [currentTerm]%d [sendto]%d [args]%+v\n",
+		rf.me, rf, rf.currentTerm, server, args)
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	return ok
 }
@@ -346,9 +350,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.log = rf.log[:prevLogSliceIndex+1]
 			rf.log = append(rf.log, args.Entries...)
 			if rf.commitIndex < args.LeaderCommit { // TODO: 需要判断吗，如果小于会怎样
-				oldIndex := rf.commitIndex
 				rf.commitIndex = args.LeaderCommit
-				go rf.apply(oldIndex, rf.commitIndex)
+				go rf.Apply()
 			}
 			reply.Success = true
 		} else {
@@ -367,6 +370,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	DPrintf(rpcSendLog,
+		"[sendingAppendEntries] [me]%d(%p) [currentTerm]%d [sendto]%d [args]%+v\n",
+		rf.me, rf, rf.currentTerm, server, args)
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	return ok
 }
@@ -435,7 +441,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	rf := &Raft{}
 	rf.peers = peers
-	rf.sendingAppendEntries = make([]bool, len(rf.peers))
+	// rf.sendingAppendEntries = make([]bool, len(rf.peers))
 	rf.persister = persister
 	rf.me = me
 
@@ -456,6 +462,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.state = FOLLOWER
 	rf.tobeFollowerCh = make(chan struct{})
 	rf.killCh = make(chan struct{})
+	rf.applyCh = applyCh
 	rf.getRandTime = func() func() time.Duration {
 		const timeoutMax = 500 // 300
 		const timeoutMin = 250 // 150
@@ -470,24 +477,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 			return t
 		}
 	}()
-	rf.apply = func(oldIndex int, newIndex int) {
-		rf.mu.Lock()
-
-		oldIndex = rf.logIndexToSliceIndex(oldIndex)
-		newIndex = rf.logIndexToSliceIndex(newIndex)
-
-		log := make([]Entry, newIndex-oldIndex)
-		copy(log, rf.log[oldIndex+1:newIndex+1])
-		rf.mu.Unlock()
-
-		for k, v := range log {
-			applyCh <- ApplyMsg{
-				CommandValid: true,
-				Command:      v.Command,
-				CommandIndex: oldIndex + 1 + k,
-			}
-		}
-	}
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -512,6 +501,28 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	}()
 
 	return rf
+}
+
+func (rf *Raft) Apply() {
+	for {
+		rf.mu.Lock()
+		if rf.lastApplied < rf.commitIndex {
+			rf.lastApplied = rf.lastApplied + 1
+			sliceIndex := rf.logIndexToSliceIndex(rf.lastApplied)
+			entry := rf.log[sliceIndex]
+			rf.mu.Unlock()
+			// TODO when persist
+
+			rf.applyCh <- ApplyMsg{
+				CommandValid: true,
+				Command:      entry.Command,
+				CommandIndex: rf.lastApplied,
+			}
+		} else {
+			rf.mu.Unlock()
+			break
+		}
+	}
 }
 
 func (rf *Raft) enterFollowerState() {
@@ -703,16 +714,30 @@ func (rf *Raft) enterLeaderState() {
 
 func (rf *Raft) sendAppendEntriesWrapper(server int, currentTerm int) (retry bool, installSnapshot bool) {
 
-	rf.mu.Lock()
-	// 防止重入堆积
-	if rf.sendingAppendEntries[server] == true {
-		rf.mu.Unlock()
-		return false, false
-	}
-	rf.sendingAppendEntries[server] = true
+	// !!! 本来想要防止函数重入，请求堆积
+	// 但是某些测试没法通过, 因为 labrpc 一个 longDelays 会导致结果超时
+	// 只能放弃防止重入了，这样会有以下几个问题：
+	//   1、某些情况的不断重试，可能会有雪崩效应
+	//   2、虽然 AppendEntries 请求是冥等的，但是乱序，原来已经提交的请求会被覆盖
+	//
+	// // 防止重入堆积
+	// if rf.sendingAppendEntries[server] == true {
+	// 	rf.mu.Unlock()
+	// 	return false, false
+	// }
+	// rf.sendingAppendEntries[server] = true
+	// defer func() {
+	// 	rf.mu.Lock()
+	// 	rf.sendingAppendEntries[server] = false
+	// 	rf.mu.Unlock()
+	// }()
 
+	// TODO 判断是否还是 leader
+
+	rf.mu.Lock()
 	var prevLogTerm int
 	if len(rf.log) == 0 {
+		// PrevLogIndex should be rf.snapshotLastIncludedIndex ? TODO
 		prevLogTerm = rf.snapshotLastIncludedTerm
 	} else {
 		prevLogSliceIndex := rf.logIndexToSliceIndex(rf.nextIndex[server] - 1)
@@ -721,7 +746,7 @@ func (rf *Raft) sendAppendEntriesWrapper(server int, currentTerm int) (retry boo
 			rf.mu.Unlock()
 			return false, true // TODO 什么情况会走到这里
 		}
-		prevLogTerm = rf.log[prevLogSliceIndex].Term
+		prevLogTerm = rf.log[prevLogSliceIndex].Term // TODO: 这里会出现 index out of range
 	}
 
 	args := AppendEntriesArgs{
@@ -751,10 +776,6 @@ func (rf *Raft) sendAppendEntriesWrapper(server int, currentTerm int) (retry boo
 	} else {
 		retry = true
 	}
-
-	rf.mu.Lock()
-	rf.sendingAppendEntries[server] = false
-	rf.mu.Unlock()
 
 	return
 }
@@ -814,15 +835,13 @@ func (rf *Raft) incMactchIndex(matchIndex int, index int) {
 			// TODO:
 		}
 		if cnt == len(rf.peers)/2+1 && matchIndex > rf.commitIndex && rf.log[matchSliceIndex].Term == rf.currentTerm {
-			oldIndex := rf.commitIndex
 			rf.commitIndex = matchIndex
 			rf.persist()
-			go rf.apply(oldIndex, rf.commitIndex)
+			go rf.Apply()
 		}
 	}
 }
 
-// TODO 边界
 // call before rf.Lock
 func (rf *Raft) logIndexToSliceIndex(logIndex int) (sliceIndex int) {
 	return logIndex - rf.snapshotLastIncludedIndex - 1
@@ -833,7 +852,7 @@ func (rf *Raft) sliceIndexToLogIndex(sliceIndex int) (logIndex int) {
 	return sliceIndex + rf.snapshotLastIncludedIndex + 1
 }
 
-func (rf *Raft) DiscardLog(index int) {
+func (rf *Raft) discardLog(index int) {
 }
 
 func (rf *Raft) RaftStateSize() int {
@@ -841,7 +860,12 @@ func (rf *Raft) RaftStateSize() int {
 }
 
 func (rf *Raft) SaveSnapshot(snapshot []byte) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	rf.persister.SaveSnapshot(snapshot)
+
+	// discard log
+
 	return
 }
 
