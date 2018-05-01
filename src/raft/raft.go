@@ -47,6 +47,7 @@ type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
 	CommandIndex int
+	Snapshot     []byte
 }
 
 type state int
@@ -176,33 +177,22 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 }
 
-//
-// example RequestVote RPC arguments structure.
-// field names must start with capital letters!
-//
+// --- RequestVote RPC
 type RequestVoteArgs struct {
-	// Your data here (2A, 2B).
+	// follow paper's Figure 2
 	Term         int
 	CandidateId  int
 	LastLogIndex int
 	LastLogTerm  int
 }
 
-//
-// example RequestVote RPC reply structure.
-// field names must start with capital letters!
-//
 type RequestVoteReply struct {
-	// Your data here (2A).
+	// follow paper's Figure 2
 	Term        int
 	VoteGranted bool
 }
 
-//
-// example RequestVote RPC handler.
-//
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	// Your code here (2A, 2B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	defer rf.persist()
@@ -257,35 +247,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	return
 }
 
-//
-// example code to send a RequestVote RPC to a server.
-// server is the index of the target server in rf.peers[].
-// expects RPC arguments in args.
-// fills in *reply with RPC reply, so caller should
-// pass &reply.
-// the types of the args and reply passed to Call() must be
-// the same as the types of the arguments declared in the
-// handler function (including whether they are pointers).
-//
-// The labrpc package simulates a lossy network, in which servers
-// may be unreachable, and in which requests and replies may be lost.
-// Call() sends a request and waits for a reply. If a reply arrives
-// within a timeout interval, Call() returns true; otherwise
-// Call() returns false. Thus Call() may not return for a while.
-// A false return can be caused by a dead server, a live server that
-// can't be reached, a lost request, or a lost reply.
-//
-// Call() is guaranteed to return (perhaps after a delay) *except* if the
-// handler function on the server side does not return.  Thus there
-// is no need to implement your own timeouts around Call().
-//
-// look at the comments in ../labrpc/labrpc.go for more details.
-//
-// if you're having trouble getting RPC to work, check that you've
-// capitalized all field names in structs passed over RPC, and
-// that the caller passes the address of the reply struct with &, not
-// the struct itself.
-//
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	DPrintf(rpcSendLog,
 		"[sendingRequestVote] [me]%d(%p) [currentTerm]%d [sendto]%d [args]%+v\n",
@@ -294,6 +255,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
+// --- AppendEntries RPC
 type AppendEntriesArgs struct {
 	// follow paper's Figure 2
 	Term         int
@@ -322,7 +284,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		if falseReason != "" {
 			logStr = logStr + fmt.Sprintf(" [falseReason !!!] %v", falseReason)
 		}
-		DPrintln(rpcRecvLog, logStr)
+		DPrintln(rpcRecvLog|appendEntriesLog, logStr)
 	}()
 
 	// if args.Term == rf.currentTerm && args.LeaderID != rf.votedFor
@@ -345,8 +307,17 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Term = rf.currentTerm
 
 	prevLogSliceIndex := rf.logIndexToSliceIndex(args.PrevLogIndex)
-	if (prevLogSliceIndex >= 0) && (len(rf.log) > prevLogSliceIndex) {
-		if args.PrevLogTerm == rf.log[prevLogSliceIndex].Term {
+	if ((prevLogSliceIndex >= 0) && (len(rf.log) > prevLogSliceIndex)) ||
+		(args.PrevLogIndex == rf.snapshotLastIncludedIndex) {
+
+		var term int
+		if args.PrevLogIndex == rf.snapshotLastIncludedIndex {
+			term = rf.snapshotLastIncludedTerm
+		} else {
+			term = rf.log[prevLogSliceIndex].Term
+		}
+
+		if args.PrevLogTerm == term {
 			rf.log = rf.log[:prevLogSliceIndex+1]
 			rf.log = append(rf.log, args.Entries...)
 			if rf.commitIndex < args.LeaderCommit { // TODO: 需要判断吗，如果小于会怎样
@@ -361,6 +332,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				args.PrevLogTerm, rf.log[prevLogSliceIndex].Term)
 		}
 	} else {
+		// 获取不了 args.PrevLogIndex 对应的 term
 		reply.Success = false
 		falseReason = fmt.Sprintf("3. prevLogSliceIndex[%v] len(rf.log)[%v]",
 			prevLogSliceIndex, len(rf.log))
@@ -370,12 +342,98 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
-	DPrintf(rpcSendLog,
+	DPrintf(rpcSendLog|appendEntriesLog,
 		"[sendingAppendEntries] [me]%d(%p) [currentTerm]%d [sendto]%d [args]%+v\n",
 		rf.me, rf, rf.currentTerm, server, args)
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	return ok
 }
+
+// --- InstallSnapshot RPC
+type InstallSnapshotArgs struct {
+	Term              int
+	LeaderID          int
+	LastIncludedIndex int
+	LastIncludedTerm  int
+	Data              []byte
+}
+
+type InstallSnapshotReply struct {
+	Term    int
+	Success bool
+}
+
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	// defer fmt.Println("size", rf.persister.RaftStateSize())
+	defer rf.persist()
+
+	var falseReason string
+	defer func() {
+		logStr := fmt.Sprintf("[InstallSnapshot] [me]%d(%p) [currentTerm]%d [args]%+v [reply]%+v",
+			rf.me, rf, rf.currentTerm, args, reply)
+		if falseReason != "" {
+			logStr = logStr + fmt.Sprintf(" [falseReason !!!] %v", falseReason)
+		}
+		DPrintln(rpcRecvLog|snapshotLog, logStr)
+	}()
+
+	// TODO 考虑两个 applyCh 的并发，有没有可能有冲突
+	// 在前还是在后
+	go func() {
+		rf.applyCh <- ApplyMsg{
+			CommandValid: false,
+			Snapshot:     args.Data,
+		}
+	}()
+	// trim log
+	sliceIndex := rf.logIndexToSliceIndex(args.LastIncludedIndex)
+	// fmt.Println("before trim log", rf.log, args.LastIncludedIndex, rf.snapshotLastIncludedIndex, sliceIndex, len(rf.log))
+	if sliceIndex >= 0 && sliceIndex+1 < len(rf.log) {
+		tmpLog := make([]Entry, len(rf.log)-1-sliceIndex)
+		copy(tmpLog, rf.log[sliceIndex+1:])
+		rf.log = tmpLog
+	} else {
+		rf.log = make([]Entry, 0, 128)
+	}
+	// fmt.Println("after trim log", rf.log, args.LastIncludedIndex)
+
+	rf.snapshotLastIncludedIndex = args.LastIncludedIndex
+	rf.snapshotLastIncludedTerm = args.LastIncludedTerm
+
+	rf.lastApplied = args.LastIncludedIndex
+	if rf.commitIndex < rf.lastApplied {
+		rf.commitIndex = rf.lastApplied
+	}
+
+	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
+		reply.Success = false
+		falseReason = fmt.Sprintf("1. args.Term[%v] < rf.currentTerm[%v]",
+			args.Term, rf.currentTerm)
+		return
+	}
+
+	rf.currentTerm = args.Term
+	go func() {
+		rf.tobeFollowerCh <- struct{}{}
+	}()
+	reply.Term = rf.currentTerm
+	reply.Success = true
+
+	return
+}
+
+func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
+	DPrintf(rpcSendLog|snapshotLog,
+		"[sendingInstallSnapshot] [me]%d(%p) [currentTerm]%d [sendto]%d [args]%+v\n",
+		rf.me, rf, rf.currentTerm, server, args)
+	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
+	return ok
+}
+
+// --- InstallSnapshot RPC
 
 //
 // the service using Raft (e.g. a k/v server) wants to start
@@ -510,13 +568,15 @@ func (rf *Raft) Apply() {
 			rf.lastApplied = rf.lastApplied + 1
 			sliceIndex := rf.logIndexToSliceIndex(rf.lastApplied)
 			entry := rf.log[sliceIndex]
+			index := rf.lastApplied
+			// fmt.Println("rf.lastApplied", rf.me, rf.lastApplied, entry)
 			rf.mu.Unlock()
 			// TODO when persist
 
 			rf.applyCh <- ApplyMsg{
 				CommandValid: true,
 				Command:      entry.Command,
-				CommandIndex: rf.lastApplied,
+				CommandIndex: index,
 			}
 		} else {
 			rf.mu.Unlock()
@@ -680,15 +740,40 @@ func (rf *Raft) enterLeaderState() {
 				if i != me {
 					go func(server int) {
 						for {
-							reply, _ := rf.sendAppendEntriesWrapper(server, currentTerm)
-							if reply == false {
+							retry, installSnapshot := rf.sendAppendEntriesWrapper(server, currentTerm)
+							if installSnapshot == true {
+								rf.mu.Lock()
+								args := InstallSnapshotArgs{
+									Term:              currentTerm,
+									LeaderID:          me,
+									LastIncludedIndex: rf.snapshotLastIncludedIndex,
+									LastIncludedTerm:  rf.snapshotLastIncludedTerm,
+									Data:              rf.persister.ReadSnapshot(),
+								}
+								rf.mu.Unlock()
+								reply := InstallSnapshotReply{}
+								// TODO: ok != true, retry
+								if ok := rf.sendInstallSnapshot(server, &args, &reply); ok {
+									rf.mu.Lock()
+									// TODO: 这两个数值给多少
+									if rf.matchIndex[server] < args.LastIncludedIndex {
+										rf.matchIndex[server] = args.LastIncludedIndex
+									}
+									if rf.nextIndex[server] < args.LastIncludedIndex+1 {
+										rf.nextIndex[server] = args.LastIncludedIndex + 1
+									}
+									rf.mu.Unlock()
+								}
+							}
+							if retry == false {
 								break
 							}
 						}
 					}(i)
 				} else {
 					rf.mu.Lock()
-					rf.incMactchIndex(len(rf.log)-1, me)
+					lastLogIndex := rf.sliceIndexToLogIndex(len(rf.log) - 1)
+					rf.incMactchIndex(lastLogIndex, me)
 					rf.mu.Unlock()
 				}
 			}
@@ -736,7 +821,8 @@ func (rf *Raft) sendAppendEntriesWrapper(server int, currentTerm int) (retry boo
 
 	rf.mu.Lock()
 	var prevLogTerm int
-	if len(rf.log) == 0 {
+	// 这两个条件等价？可能只出现一个吗?好像不可能
+	if len(rf.log) == 0 || (rf.nextIndex[server]-1 == rf.snapshotLastIncludedIndex) {
 		// PrevLogIndex should be rf.snapshotLastIncludedIndex ? TODO
 		prevLogTerm = rf.snapshotLastIncludedTerm
 	} else {
@@ -744,6 +830,7 @@ func (rf *Raft) sendAppendEntriesWrapper(server int, currentTerm int) (retry boo
 		if prevLogSliceIndex < 0 {
 			// TODO
 			rf.mu.Unlock()
+			// fmt.Println("aaaaaaaaaa", rf.me, server, rf.nextIndex[server]-1, prevLogSliceIndex, len(rf.log))
 			return false, true // TODO 什么情况会走到这里
 		}
 		prevLogTerm = rf.log[prevLogSliceIndex].Term // TODO: 这里会出现 index out of range
@@ -759,6 +846,7 @@ func (rf *Raft) sendAppendEntriesWrapper(server int, currentTerm int) (retry boo
 	nextSliceIndex := rf.logIndexToSliceIndex(rf.nextIndex[server])
 	if nextSliceIndex < 0 {
 		rf.mu.Unlock()
+		// fmt.Println("bbbbbbb", rf.nextIndex[server], nextSliceIndex, len(rf.log))
 		return false, true // TODO 什么情况会走到这里
 	}
 	lastSliceIndex := len(rf.log) - 1
@@ -773,6 +861,9 @@ func (rf *Raft) sendAppendEntriesWrapper(server int, currentTerm int) (retry boo
 
 	if ok := rf.sendAppendEntries(server, &args, &reply); ok {
 		retry, installSnapshot = rf.handleAppendEntriesReply(&reply, lastLogIndex, server)
+		if installSnapshot == true {
+			// fmt.Println("ccccccccccc", rf.nextIndex[server])
+		}
 	} else {
 		retry = true
 	}
@@ -803,8 +894,10 @@ func (rf *Raft) handleAppendEntriesReply(reply *AppendEntriesReply, lastLogIndex
 				// }
 				nextIndex := rf.logIndexToSliceIndex(rf.nextIndex[server])
 				if nextIndex < 0 {
+					// TODO add log
 					return false, true
 				} else {
+					// TODO add log
 					return true, false
 				}
 				// if rf.nextIndex[server] < 1 { // add this for fix bug
@@ -818,7 +911,9 @@ func (rf *Raft) handleAppendEntriesReply(reply *AppendEntriesReply, lastLogIndex
 }
 
 // should be called after rf.mu.Lock()
+// TODO index --> server
 func (rf *Raft) incMactchIndex(matchIndex int, index int) {
+	// fmt.Println("matchIndex", matchIndex, "index", index, rf.matchIndex[index])
 	if rf.matchIndex[index] != matchIndex {
 		rf.nextIndex[index] = matchIndex + 1
 		rf.matchIndex[index] = matchIndex
@@ -852,19 +947,34 @@ func (rf *Raft) sliceIndexToLogIndex(sliceIndex int) (logIndex int) {
 	return sliceIndex + rf.snapshotLastIncludedIndex + 1
 }
 
-func (rf *Raft) discardLog(index int) {
-}
-
 func (rf *Raft) RaftStateSize() int {
 	return rf.persister.RaftStateSize()
 }
 
-func (rf *Raft) SaveSnapshot(snapshot []byte) {
+func (rf *Raft) SaveSnapshot(snapshot []byte, index int) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	rf.persister.SaveSnapshot(snapshot)
 
 	// discard log
+	sliceIndex := rf.logIndexToSliceIndex(index)
+	if sliceIndex < 0 || sliceIndex >= len(rf.log) {
+		panic("impossible here") // 不会走到这里
+	}
+	rf.snapshotLastIncludedIndex = index
+	rf.snapshotLastIncludedTerm = rf.log[sliceIndex].Term
+
+	// fmt.Println(rf.me, "xxxx before trim log", rf.log, len(rf.log), index, sliceIndex)
+	if sliceIndex == (len(rf.log) - 1) {
+		rf.log = make([]Entry, 0, 128)
+	} else {
+		tmpLog := make([]Entry, len(rf.log)-1-sliceIndex)
+		copy(tmpLog, rf.log[sliceIndex+1:])
+		rf.log = tmpLog
+	}
+	// fmt.Println(rf.me, "xxx after trim log", rf.log, len(rf.log))
+
+	rf.persist()
 
 	return
 }

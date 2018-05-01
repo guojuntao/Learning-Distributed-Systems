@@ -57,6 +57,11 @@ type RaftKV struct {
 	dplDtc    map[int64]int64                    // duplicate detection
 }
 
+type persistKV struct {
+	Store  map[string]string
+	DplDtc map[int64]int64
+}
+
 func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
 	DPrintf("[Server Get function] %+v", args)
@@ -113,71 +118,105 @@ func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 
 func (kv *RaftKV) recvApplyMsg() {
 	for applyMsg := range kv.applyCh {
-		DPrintf("[Server recvApplyMsg] %p %+v %+v", kv.rf, applyMsg, applyMsg.Command)
-		// applyMsg.CommandValid
-		command := applyMsg.Command
-		index := applyMsg.CommandIndex
-
 		kv.mu.Lock() // need ? TODO
-		term, _ := kv.rf.GetState()
-		if op, ok := command.(Op); ok {
-			reqID := kv.dplDtc[op.ClerkID]
-			// 这样简单处理有问题吗？依赖顺序 TODO
-			// && reqID cycle? 0
-			dup := false
-			if reqID >= op.ReqID {
-				dup = true
-			} else { // reqID < op.ReqID
-				kv.dplDtc[op.ClerkID] = op.ReqID
-			}
+		DPrintf("[Server recvApplyMsg] %p %+v %+v", kv.rf, applyMsg, applyMsg.Command)
+		commandValid := applyMsg.CommandValid
+		if commandValid == true {
+			command := applyMsg.Command
+			index := applyMsg.CommandIndex
 
-			switch op.Op {
-			case "Put":
-				if dup != true {
-					kv.store[op.Key] = op.Value
+			term, _ := kv.rf.GetState()
+			if op, ok := command.(Op); ok {
+				reqID := kv.dplDtc[op.ClerkID]
+				// 这样简单处理有问题吗？依赖顺序 TODO
+				// && reqID cycle? 0
+				dup := false
+				if reqID >= op.ReqID {
+					dup = true
+				} else { // reqID < op.ReqID
+					kv.dplDtc[op.ClerkID] = op.ReqID
 				}
-				key := noticeChKey{index, term}
-				if kv.noticeChs[key] != nil {
+
+				switch op.Op {
+				case "Put":
 					if dup != true {
-						kv.noticeChs[key] <- noticeChValue{true, "", OK}
-					} else {
-						kv.noticeChs[key] <- noticeChValue{true, "", Dup}
-					}
-					close(kv.noticeChs[key])
-				}
-			case "Append":
-				if dup != true {
-					if original, ok := kv.store[op.Key]; ok {
-						kv.store[op.Key] = original + op.Value
-					} else {
 						kv.store[op.Key] = op.Value
 					}
-				}
-				key := noticeChKey{index, term}
-				if kv.noticeChs[key] != nil {
+					key := noticeChKey{index, term}
+					if kv.noticeChs[key] != nil {
+						if dup != true {
+							kv.noticeChs[key] <- noticeChValue{true, "", OK}
+						} else {
+							kv.noticeChs[key] <- noticeChValue{true, "", Dup}
+						}
+						close(kv.noticeChs[key])
+					}
+				case "Append":
 					if dup != true {
-						kv.noticeChs[key] <- noticeChValue{true, "", OK}
-					} else {
-						kv.noticeChs[key] <- noticeChValue{true, "", Dup}
+						if original, ok := kv.store[op.Key]; ok {
+							kv.store[op.Key] = original + op.Value
+						} else {
+							kv.store[op.Key] = op.Value
+						}
 					}
-					close(kv.noticeChs[key])
-				}
-			case "Get":
-				key := noticeChKey{index, term}
-				if kv.noticeChs[key] != nil {
-					if value, ok := kv.store[op.Key]; ok {
-						kv.noticeChs[key] <- noticeChValue{true, value, OK}
-					} else {
-						kv.noticeChs[key] <- noticeChValue{true, value, ErrNoKey}
+					key := noticeChKey{index, term}
+					if kv.noticeChs[key] != nil {
+						if dup != true {
+							kv.noticeChs[key] <- noticeChValue{true, "", OK}
+						} else {
+							kv.noticeChs[key] <- noticeChValue{true, "", Dup}
+						}
+						close(kv.noticeChs[key])
 					}
-					close(kv.noticeChs[key])
+				case "Get":
+					key := noticeChKey{index, term}
+					if kv.noticeChs[key] != nil {
+						if value, ok := kv.store[op.Key]; ok {
+							kv.noticeChs[key] <- noticeChValue{true, value, OK}
+						} else {
+							kv.noticeChs[key] <- noticeChValue{true, value, ErrNoKey}
+						}
+						close(kv.noticeChs[key])
+					}
+				default:
+					DPrintf("xxxxxxxxx err op %v", op)
+					// error
 				}
-			default:
+			} else {
 				DPrintf("xxxxxxxxx err op %v", op)
-				// error
 			}
+
+			// 判断是否需要 snapshot
+			if kv.maxraftstate > 0 && kv.rf.RaftStateSize() > kv.maxraftstate {
+				// fmt.Println(kv.rf.RaftStateSize(), "xxxxxxxxxx", index)
+				w := new(bytes.Buffer)
+				e := labgob.NewEncoder(w)
+				e.Encode(persistKV{
+					Store:  kv.store,
+					DplDtc: kv.dplDtc,
+				})
+				data := w.Bytes()
+				kv.rf.SaveSnapshot(data, index)
+			}
+
 		} else {
-			DPrintf("xxxxxxxxx err op %v", op)
+			// 接收 snapshot 消息，状态机更改
+			data := applyMsg.Snapshot
+			if data == nil || len(data) < 1 {
+				kv.mu.Unlock()
+				// TODO some error
+				return
+			}
+			r := bytes.NewBuffer(data)
+			d := labgob.NewDecoder(r)
+			var snapshot persistKV
+			if err := d.Decode(&snapshot); err != nil {
+				panic(err) // panic is ok ? TODO
+			} else {
+				// DPrintf(persistLog, "[me]%d(%p) [readPersist]%+v\n", rf.me, rf, pRf)
+				kv.store = snapshot.Store
+				kv.dplDtc = snapshot.DplDtc
+			}
 		}
 		kv.mu.Unlock()
 	}
@@ -238,6 +277,7 @@ type persistRaft struct {
 	CommitIndex int
 }
 
+// TODO 通过读取 snapshot 重启
 func (kv *RaftKV) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
