@@ -4,7 +4,6 @@ package raft
 // 3. stop timer & close voteCh
 // 4. 日志还需要进一步整理
 // 5. TestFigure8Unreliable2C 还没通过
-// 7. rf.lastApplied 理解错了，修正！！！
 // 8. -race
 
 //
@@ -94,26 +93,20 @@ type Raft struct {
 	state          state
 	tobeFollowerCh chan struct{}
 	killCh         chan struct{}
-	getRandTime    func() time.Duration
 	applyCh        chan ApplyMsg
-
-	// 防止 sendAppendEntriesWrapper 重入
-	// sendingAppendEntries []bool
+	getRandTime    func() time.Duration
 }
 
 // return currentTerm and whether this server
 // believes it is the leader.
-func (rf *Raft) GetState() (int, bool) {
-
-	var term int
-	var isleader bool
-	// Your code here (2A).
+func (rf *Raft) GetState() (term int, isleader bool) {
 	rf.mu.Lock()
 	term = rf.currentTerm
 	if rf.state == LEADER {
 		isleader = true
 	}
 	rf.mu.Unlock()
+
 	return term, isleader
 }
 
@@ -122,7 +115,7 @@ type persistRaft struct {
 	VotedFor    int
 	Log         []Entry
 	CommitIndex int
-	LastApplied int
+	LastApplied int // 这个需要保存吗？TODO
 
 	SnapshotLastIncludedIndex int
 	SnapshotLastIncludedTerm  int
@@ -134,18 +127,17 @@ type persistRaft struct {
 // see paper's Figure 2 for a description of what should be persistent.
 //
 func (rf *Raft) persist() {
-	// Your code here (2C).
-	// Example:
-
 	// should be called after rf.mu.Lock()
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	e.Encode(persistRaft{
-		CurrentTerm: rf.currentTerm,
-		VotedFor:    rf.votedFor,
-		Log:         rf.log,
-		CommitIndex: rf.commitIndex,
-		LastApplied: rf.lastApplied,
+		CurrentTerm:               rf.currentTerm,
+		VotedFor:                  rf.votedFor,
+		Log:                       rf.log,
+		CommitIndex:               rf.commitIndex,
+		LastApplied:               rf.lastApplied,
+		SnapshotLastIncludedIndex: rf.snapshotLastIncludedIndex,
+		SnapshotLastIncludedTerm:  rf.snapshotLastIncludedTerm,
 	})
 	data := w.Bytes()
 	rf.persister.SaveRaftState(data)
@@ -155,29 +147,30 @@ func (rf *Raft) persist() {
 // restore previously persisted state.
 //
 func (rf *Raft) readPersist(data []byte) {
-	if data == nil || len(data) < 1 { // bootstrap without any state?
+	if data == nil || len(data) < 1 { // bootstrap without any state
 		return
 	}
-	// Your code here (2C).
-	// Example:
+
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
 	var pRf persistRaft
 	if err := d.Decode(&pRf); err != nil {
-		panic(err)
-	} else {
-		rf.mu.Lock()
-		DPrintf(persistLog, "[me]%d(%p) [readPersist]%+v\n", rf.me, rf, pRf)
-		rf.currentTerm = pRf.CurrentTerm
-		rf.votedFor = pRf.VotedFor
-		rf.log = pRf.Log
-		rf.commitIndex = pRf.CommitIndex
-		rf.lastApplied = pRf.LastApplied
-		rf.mu.Unlock()
+		panic(err) // TODO panic 合适吗
 	}
+
+	rf.mu.Lock()
+	DPrintf(persistLog, "[me]%d(%p) [readPersist]%+v\n", rf.me, rf, pRf)
+	rf.currentTerm = pRf.CurrentTerm
+	rf.votedFor = pRf.VotedFor
+	rf.log = pRf.Log
+	rf.commitIndex = pRf.CommitIndex
+	rf.lastApplied = pRf.LastApplied
+	rf.snapshotLastIncludedIndex = pRf.SnapshotLastIncludedIndex
+	rf.snapshotLastIncludedTerm = pRf.SnapshotLastIncludedTerm
+	rf.mu.Unlock()
 }
 
-// --- RequestVote RPC
+// ------------------------------------------------------------ RequestVote RPC
 type RequestVoteArgs struct {
 	// follow paper's Figure 2
 	Term         int
@@ -204,7 +197,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		if falseReason != "" {
 			logStr = logStr + fmt.Sprintf(" [falseReason !!!] %v", falseReason)
 		}
-		DPrintln(rpcRecvLog, logStr)
+		DPrintln(rpcRecvLog|requestVoteLog, logStr)
 	}()
 
 	var lastLogIndex int
@@ -213,7 +206,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		lastLogIndex = rf.snapshotLastIncludedIndex
 		lastLogTerm = rf.snapshotLastIncludedTerm
 	} else {
-		lastLogIndex = rf.sliceIndexToLogIndex(len(rf.log) - 1)
+		lastLogIndex = rf.SliceIndexToLogIndex(len(rf.log) - 1)
 		lastLogTerm = rf.log[len(rf.log)-1].Term
 	}
 
@@ -248,14 +241,14 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 }
 
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-	DPrintf(rpcSendLog,
+	DPrintf(rpcSendLog|requestVoteLog,
 		"[sendingRequestVote] [me]%d(%p) [currentTerm]%d [sendto]%d [args]%+v\n",
 		rf.me, rf, rf.currentTerm, server, args)
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	return ok
 }
 
-// --- AppendEntries RPC
+// ---------------------------------------------------------- AppendEntries RPC
 type AppendEntriesArgs struct {
 	// follow paper's Figure 2
 	Term         int
@@ -306,7 +299,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}()
 	reply.Term = rf.currentTerm
 
-	prevLogSliceIndex := rf.logIndexToSliceIndex(args.PrevLogIndex)
+	prevLogSliceIndex := rf.LogIndexToSliceIndex(args.PrevLogIndex)
 	if ((prevLogSliceIndex >= 0) && (len(rf.log) > prevLogSliceIndex)) ||
 		(args.PrevLogIndex == rf.snapshotLastIncludedIndex) {
 
@@ -349,7 +342,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	return ok
 }
 
-// --- InstallSnapshot RPC
+// -------------------------------------------------------- InstallSnapshot RPC
 type InstallSnapshotArgs struct {
 	Term              int
 	LeaderID          int
@@ -388,7 +381,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		}
 	}()
 	// trim log
-	sliceIndex := rf.logIndexToSliceIndex(args.LastIncludedIndex)
+	sliceIndex := rf.LogIndexToSliceIndex(args.LastIncludedIndex)
 	// fmt.Println("before trim log", rf.log, args.LastIncludedIndex, rf.snapshotLastIncludedIndex, sliceIndex, len(rf.log))
 	if sliceIndex >= 0 && sliceIndex+1 < len(rf.log) {
 		tmpLog := make([]Entry, len(rf.log)-1-sliceIndex)
@@ -402,6 +395,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	rf.snapshotLastIncludedIndex = args.LastIncludedIndex
 	rf.snapshotLastIncludedTerm = args.LastIncludedTerm
 
+	fmt.Println("11111111111111111111111111", rf.lastApplied, args.LastIncludedIndex)
 	rf.lastApplied = args.LastIncludedIndex
 	if rf.commitIndex < rf.lastApplied {
 		rf.commitIndex = rf.lastApplied
@@ -433,8 +427,6 @@ func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply
 	return ok
 }
 
-// --- InstallSnapshot RPC
-
 //
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
@@ -464,7 +456,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		DPrintf(startLog, "[Start] [me]%d(%p) [currentTerm]%d [command]%v\n", rf.me, rf, rf.currentTerm, command)
 		rf.log = append(rf.log, Entry{rf.currentTerm, command})
 
-		index = rf.sliceIndexToLogIndex(len(rf.log) - 1)
+		index = rf.SliceIndexToLogIndex(len(rf.log) - 1)
 		term = rf.currentTerm
 	}
 	return index, term, isLeader
@@ -499,7 +491,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	rf := &Raft{}
 	rf.peers = peers
-	// rf.sendingAppendEntries = make([]bool, len(rf.peers))
 	rf.persister = persister
 	rf.me = me
 
@@ -509,7 +500,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.currentTerm = 0
 	rf.votedFor = -1
 	rf.log = make([]Entry, 0, 128)
-	rf.log = append(rf.log, Entry{0, nil}) // init rf.log, 初始阶段需要发送 PrevLogIndex & PrevLogTerm
+	rf.log = append(rf.log, Entry{0, nil}) // init rf.log, 开始阶段需要发送 PrevLogIndex & PrevLogTerm
 	rf.lastApplied = 0
 	rf.commitIndex = 0
 	rf.nextIndex = make([]int, len(rf.peers))
@@ -521,6 +512,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.tobeFollowerCh = make(chan struct{})
 	rf.killCh = make(chan struct{})
 	rf.applyCh = applyCh
+
 	rf.getRandTime = func() func() time.Duration {
 		const timeoutMax = 500 // 300
 		const timeoutMin = 250 // 150
@@ -566,7 +558,7 @@ func (rf *Raft) Apply() {
 		rf.mu.Lock()
 		if rf.lastApplied < rf.commitIndex {
 			rf.lastApplied = rf.lastApplied + 1
-			sliceIndex := rf.logIndexToSliceIndex(rf.lastApplied)
+			sliceIndex := rf.LogIndexToSliceIndex(rf.lastApplied)
 			entry := rf.log[sliceIndex]
 			index := rf.lastApplied
 			// fmt.Println("rf.lastApplied", rf.me, rf.lastApplied, entry)
@@ -639,7 +631,7 @@ func (rf *Raft) enterCandidateState() {
 		lastLogIndex = rf.snapshotLastIncludedIndex
 		lastLogTerm = rf.snapshotLastIncludedTerm
 	} else {
-		lastLogIndex = rf.sliceIndexToLogIndex(len(rf.log) - 1)
+		lastLogIndex = rf.SliceIndexToLogIndex(len(rf.log) - 1)
 		lastLogTerm = rf.log[len(rf.log)-1].Term
 	}
 
@@ -720,7 +712,7 @@ func (rf *Raft) enterLeaderState() {
 	currentTerm := rf.currentTerm
 
 	for i := 0; i < length; i++ {
-		rf.nextIndex[i] = rf.sliceIndexToLogIndex(len(rf.log))
+		rf.nextIndex[i] = rf.SliceIndexToLogIndex(len(rf.log))
 		rf.matchIndex[i] = 0
 	}
 	rf.mu.Unlock()
@@ -772,7 +764,7 @@ func (rf *Raft) enterLeaderState() {
 					}(i)
 				} else {
 					rf.mu.Lock()
-					lastLogIndex := rf.sliceIndexToLogIndex(len(rf.log) - 1)
+					lastLogIndex := rf.SliceIndexToLogIndex(len(rf.log) - 1)
 					rf.incMactchIndex(lastLogIndex, me)
 					rf.mu.Unlock()
 				}
@@ -826,7 +818,7 @@ func (rf *Raft) sendAppendEntriesWrapper(server int, currentTerm int) (retry boo
 		// PrevLogIndex should be rf.snapshotLastIncludedIndex ? TODO
 		prevLogTerm = rf.snapshotLastIncludedTerm
 	} else {
-		prevLogSliceIndex := rf.logIndexToSliceIndex(rf.nextIndex[server] - 1)
+		prevLogSliceIndex := rf.LogIndexToSliceIndex(rf.nextIndex[server] - 1)
 		if prevLogSliceIndex < 0 {
 			// TODO
 			rf.mu.Unlock()
@@ -843,7 +835,7 @@ func (rf *Raft) sendAppendEntriesWrapper(server int, currentTerm int) (retry boo
 		PrevLogTerm:  prevLogTerm,
 		LeaderCommit: rf.commitIndex,
 	}
-	nextSliceIndex := rf.logIndexToSliceIndex(rf.nextIndex[server])
+	nextSliceIndex := rf.LogIndexToSliceIndex(rf.nextIndex[server])
 	if nextSliceIndex < 0 {
 		rf.mu.Unlock()
 		// fmt.Println("bbbbbbb", rf.nextIndex[server], nextSliceIndex, len(rf.log))
@@ -854,7 +846,7 @@ func (rf *Raft) sendAppendEntriesWrapper(server int, currentTerm int) (retry boo
 		args.Entries = make([]Entry, lastSliceIndex+1-nextSliceIndex)
 		copy(args.Entries, rf.log[nextSliceIndex:lastSliceIndex+1])
 	}
-	lastLogIndex := rf.sliceIndexToLogIndex(lastSliceIndex)
+	lastLogIndex := rf.SliceIndexToLogIndex(lastSliceIndex)
 	rf.mu.Unlock()
 
 	reply := AppendEntriesReply{}
@@ -892,7 +884,7 @@ func (rf *Raft) handleAppendEntriesReply(reply *AppendEntriesReply, lastLogIndex
 				// if rf.nextIndex[server] > reply.LastApplied {
 				// 	rf.nextIndex[server] = reply.LastApplied + 1
 				// }
-				nextIndex := rf.logIndexToSliceIndex(rf.nextIndex[server])
+				nextIndex := rf.LogIndexToSliceIndex(rf.nextIndex[server])
 				if nextIndex < 0 {
 					// TODO add log
 					return false, true
@@ -925,7 +917,7 @@ func (rf *Raft) incMactchIndex(matchIndex int, index int) {
 			}
 		}
 
-		matchSliceIndex := rf.logIndexToSliceIndex(matchIndex)
+		matchSliceIndex := rf.LogIndexToSliceIndex(matchIndex)
 		if matchSliceIndex < 0 {
 			// TODO:
 		}
@@ -938,12 +930,12 @@ func (rf *Raft) incMactchIndex(matchIndex int, index int) {
 }
 
 // call before rf.Lock
-func (rf *Raft) logIndexToSliceIndex(logIndex int) (sliceIndex int) {
+func (rf *Raft) LogIndexToSliceIndex(logIndex int) (sliceIndex int) {
 	return logIndex - rf.snapshotLastIncludedIndex - 1
 }
 
 // call before rf.Lock
-func (rf *Raft) sliceIndexToLogIndex(sliceIndex int) (logIndex int) {
+func (rf *Raft) SliceIndexToLogIndex(sliceIndex int) (logIndex int) {
 	return sliceIndex + rf.snapshotLastIncludedIndex + 1
 }
 
@@ -957,7 +949,7 @@ func (rf *Raft) SaveSnapshot(snapshot []byte, index int) {
 	rf.persister.SaveSnapshot(snapshot)
 
 	// discard log
-	sliceIndex := rf.logIndexToSliceIndex(index)
+	sliceIndex := rf.LogIndexToSliceIndex(index)
 	if sliceIndex < 0 || sliceIndex >= len(rf.log) {
 		panic("impossible here") // 不会走到这里
 	}
@@ -978,5 +970,14 @@ func (rf *Raft) SaveSnapshot(snapshot []byte, index int) {
 
 	return
 }
+
+// 5月2日凌晨 debug 修改三处
+// 1、incMactchIndex 调用的 index 没用 logIndex 用了 sliceIndex
+// 2、installSnapshot RPC
+//		if args.PrevLogIndex == rf.snapshotLastIncludedIndex {
+//			term = rf.snapshotLastIncludedTerm
+//		}
+//    还有几个点也是临界 lastInclude* 的问题
+// 3、copy 误用
 
 // TODO: 为什么 raft 死锁了，test 就会卡住

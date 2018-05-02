@@ -1,5 +1,9 @@
 package raftkv
 
+import (
+	"log"
+)
+
 const (
 	OK       = "OK"
 	ErrNoKey = "ErrNoKey"
@@ -36,4 +40,30 @@ type GetReply struct {
 	WrongLeader bool
 	Err         Err
 	Value       string
+}
+
+// debug log
+const debugLevel = 0xffff
+
+const getLog = 0x0001
+const putAppendLog = 0x0002
+
+const serverLog = 0x0010
+const clientLog = 0x0020
+
+const recvApplyMsgLog = 0x0100
+const readPersistLog = 0x0200
+
+func DPrintf(level uint, format string, a ...interface{}) (n int, err error) {
+	if debugLevel&level != 0 {
+		log.Printf(format, a...)
+	}
+	return
+}
+
+func DPrintln(level uint, a ...interface{}) (n int, err error) {
+	if debugLevel&level != 0 {
+		log.Println(a...)
+	}
+	return
 }

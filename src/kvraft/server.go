@@ -4,21 +4,12 @@ import (
 	"bytes"
 	"labgob"
 	"labrpc"
-	"log"
 	"raft"
 	"sync"
 	"time"
 )
 
-const Debug = 0
-
-func DPrintf(format string, a ...interface{}) (n int, err error) {
-	if Debug > 0 {
-		log.Printf(format, a...)
-	}
-	return
-}
-
+// 存在 raft 日志的内容
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
@@ -52,9 +43,10 @@ type RaftKV struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	store     map[string]string
+	store  map[string]string
+	dplDtc map[int64]int64 // duplicate detection
+
 	noticeChs map[noticeChKey]chan noticeChValue // TODO release, nil
-	dplDtc    map[int64]int64                    // duplicate detection
 }
 
 type persistKV struct {
@@ -64,7 +56,7 @@ type persistKV struct {
 
 func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
-	DPrintf("[Server Get function] %+v", args)
+	DPrintf(getLog|serverLog, "[Server Get function] %+v\n", args)
 	index, term, isLeader := kv.rf.Start(Op{args.Key, "", "Get", args.ClerkID, args.ReqID})
 	if isLeader == false {
 		reply.WrongLeader = true
@@ -74,7 +66,7 @@ func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
 	kv.noticeChs[noticeChKey{index, term}] = rCh
 	select {
 	case r := <-rCh:
-		DPrintf("[Server Get rCh] %+v", r)
+		DPrintf(getLog|serverLog, "[Server Get rCh] %+v\n", r)
 		if r.succ == true {
 			reply.WrongLeader = false
 			reply.Err = OK
@@ -91,7 +83,7 @@ func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
 
 func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
-	DPrintf("[Server PutAppend function] %+v", args)
+	DPrintf(putAppendLog|serverLog, "[Server PutAppend function] %+v", args)
 	index, term, isLeader := kv.rf.Start(Op{args.Key, args.Value, args.Op, args.ClerkID, args.ReqID})
 	if isLeader == false {
 		reply.WrongLeader = true
@@ -102,7 +94,7 @@ func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	kv.noticeChs[noticeChKey{index, term}] = rCh
 	select {
 	case r := <-rCh:
-		DPrintf("[Server PutAppend rCh] %+v", r)
+		DPrintf(putAppendLog|serverLog, "[Server PutAppend rCh] %+v", r)
 		if r.succ == true {
 			reply.WrongLeader = false
 			reply.Err = OK
@@ -119,7 +111,7 @@ func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 func (kv *RaftKV) recvApplyMsg() {
 	for applyMsg := range kv.applyCh {
 		kv.mu.Lock() // need ? TODO
-		DPrintf("[Server recvApplyMsg] %p %+v %+v", kv.rf, applyMsg, applyMsg.Command)
+		DPrintf(recvApplyMsgLog, "[Server recvApplyMsg] %p %+v %+v", kv.rf, applyMsg, applyMsg.Command)
 		commandValid := applyMsg.CommandValid
 		if commandValid == true {
 			command := applyMsg.Command
@@ -145,7 +137,7 @@ func (kv *RaftKV) recvApplyMsg() {
 					key := noticeChKey{index, term}
 					if kv.noticeChs[key] != nil {
 						if dup != true {
-							kv.noticeChs[key] <- noticeChValue{true, "", OK}
+							kv.noticeChs[key] <- noticeChValue{true, "", OK} // TODO panic: send on closed channel
 						} else {
 							kv.noticeChs[key] <- noticeChValue{true, "", Dup}
 						}
@@ -179,11 +171,11 @@ func (kv *RaftKV) recvApplyMsg() {
 						close(kv.noticeChs[key])
 					}
 				default:
-					DPrintf("xxxxxxxxx err op %v", op)
+					DPrintf(recvApplyMsgLog, "xxxxxxxxx err op %v", op)
 					// error
 				}
 			} else {
-				DPrintf("xxxxxxxxx err op %v", op)
+				DPrintf(recvApplyMsgLog, "xxxxxxxxx err op %v", op)
 			}
 
 			// 判断是否需要 snapshot
@@ -265,7 +257,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.noticeChs = make(map[noticeChKey]chan noticeChValue)
 	kv.dplDtc = make(map[int64]int64)
 
-	kv.readPersist(persister.ReadRaftState())
+	kv.readPersist(persister)
 
 	go kv.recvApplyMsg()
 
@@ -277,20 +269,36 @@ type persistRaft struct {
 	CommitIndex int
 }
 
-// TODO 通过读取 snapshot 重启
-func (kv *RaftKV) readPersist(data []byte) {
-	if data == nil || len(data) < 1 { // bootstrap without any state?
-		return
+func (kv *RaftKV) readPersist(persister *raft.Persister) {
+	// 先读取 snapshot
+	snapshotData := persister.ReadSnapshot()
+	if snapshotData != nil && len(snapshotData) > 0 {
+		r := bytes.NewBuffer(snapshotData)
+		d := labgob.NewDecoder(r)
+		var pKV persistKV
+		if err := d.Decode(&pKV); err != nil {
+			panic(err) // TODO should panic ?
+		}
+		DPrintf(readPersistLog, "[kv raft readPersist snapshot] %+v\n", pKV)
+		kv.store = pKV.Store
+		kv.dplDtc = pKV.DplDtc
 	}
-	r := bytes.NewBuffer(data)
-	d := labgob.NewDecoder(r)
-	var pRf persistRaft
-	if err := d.Decode(&pRf); err != nil {
-		panic(err)
-	} else {
-		DPrintf("[kv raft readPersist] %+v\n", pRf)
+
+	// 再读取 raftstate
+	raftstateData := persister.ReadRaftState()
+	if raftstateData != nil && len(raftstateData) > 0 {
+		r := bytes.NewBuffer(raftstateData)
+		d := labgob.NewDecoder(r)
+		var pRf persistRaft
+		if err := d.Decode(&pRf); err != nil {
+			panic(err) // TODO should panic ?
+		}
+		DPrintf(readPersistLog, "[kv raft readPersist raftstate] %+v\n", pRf)
 		log := pRf.Log
-		for i := 1; i <= pRf.CommitIndex; i++ {
+		commitSliceIndex := kv.rf.LogIndexToSliceIndex(pRf.CommitIndex)
+		// TODO ignore pRf.lastApplied ??
+		// modify kv.rf.lastApplied = pRf.CommitIndex !! TODO
+		for i := 0; i <= commitSliceIndex; i++ {
 			entry := log[i]
 			command := entry.Command
 			if op, ok := command.(Op); ok {
@@ -316,11 +324,11 @@ func (kv *RaftKV) readPersist(data []byte) {
 						}
 					}
 				default:
-					DPrintf("xxxxxxxxx err op %v", op)
+					DPrintf(readPersistLog, "xxxxxxxxx err op %v", op)
 					// error
 				}
 			} else {
-				DPrintf("xxxxxxxxx err op %v", op)
+				DPrintf(readPersistLog, "xxxxxxxxx err op %v", op)
 			}
 		}
 	}

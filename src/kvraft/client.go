@@ -7,7 +7,8 @@ import "math/big"
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
-	// lock ?
+
+	// TODO need lock ?
 	leaderIndex int
 	reqID       int64
 	clerkID     int64
@@ -44,11 +45,10 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 func (ck *Clerk) Get(key string) string {
 	ck.reqID = ck.reqID + 1
 	args := GetArgs{key, ck.clerkID, ck.reqID}
-	// for i := 0; i < len(ck.servers); i++ {
 	for {
 		reply := GetReply{}
 		ok := ck.servers[ck.leaderIndex].Call("RaftKV.Get", &args, &reply)
-		DPrintf("[Client Get reply] %d %+v %+v %v", ck.leaderIndex, args, reply, ok)
+		DPrintf(getLog|clientLog, "[Client Get reply] %d %+v %+v %v", ck.leaderIndex, args, reply, ok)
 		if ok && reply.WrongLeader == false && reply.Err != "timeout" {
 			return reply.Value // TODO ignore reply.Err ?
 		}
@@ -73,11 +73,10 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
 	ck.reqID = ck.reqID + 1 // 不同 clerk 区分？lock?
 	args := PutAppendArgs{key, value, op, ck.clerkID, ck.reqID}
-	// for i := 0; i < len(ck.servers); i++ {
 	for {
 		reply := PutAppendReply{}
 		ok := ck.servers[ck.leaderIndex].Call("RaftKV.PutAppend", &args, &reply)
-		DPrintf("[Client PutAppend reply] %d %+v %+v %v", ck.leaderIndex, args, reply, ok)
+		DPrintf(putAppendLog|clientLog, "[Client PutAppend reply] %d %+v %+v %v", ck.leaderIndex, args, reply, ok)
 		if ok && reply.WrongLeader == false && reply.Err != "timeout" {
 			return // ignore reply.Err ?
 		}
