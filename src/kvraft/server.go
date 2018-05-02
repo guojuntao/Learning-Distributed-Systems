@@ -54,19 +54,24 @@ type persistKV struct {
 	DplDtc map[int64]int64
 }
 
+// TODO 能不能通过指针唯一标记一个请求
 func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
-	DPrintf(getLog|serverLog, "[Server Get function] %+v\n", args)
 	index, term, isLeader := kv.rf.Start(Op{args.Key, "", "Get", args.ClerkID, args.ReqID})
 	if isLeader == false {
 		reply.WrongLeader = true
 		return
 	}
+	DPrintf(getLog|serverLog, "[Server Get function] me[%d(%p)] %+v", kv.me, kv.rf, args)
 	rCh := make(chan noticeChValue, 1) // 非同步 chan
-	kv.noticeChs[noticeChKey{index, term}] = rCh
+	// TODO: add lock
+	kv.mu.Lock()
+	key := noticeChKey{index, term}
+	kv.noticeChs[key] = rCh
+	kv.mu.Unlock()
 	select {
 	case r := <-rCh:
-		DPrintf(getLog|serverLog, "[Server Get rCh] %+v\n", r)
+		DPrintf(getLog|serverLog, "[Server Get rCh] me[%d(%p)] %+v key[%+v]", kv.me, kv.rf, r, key)
 		if r.succ == true {
 			reply.WrongLeader = false
 			reply.Err = OK
@@ -83,18 +88,22 @@ func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
 
 func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
-	DPrintf(putAppendLog|serverLog, "[Server PutAppend function] %+v", args)
 	index, term, isLeader := kv.rf.Start(Op{args.Key, args.Value, args.Op, args.ClerkID, args.ReqID})
 	if isLeader == false {
 		reply.WrongLeader = true
 		// reply.Err = nil
 		return
 	}
+	DPrintf(putAppendLog|serverLog, "[Server PutAppend function] me[%d(%p)] %+v", kv.me, kv.rf, args)
 	rCh := make(chan noticeChValue, 1) // 非同步 chan
-	kv.noticeChs[noticeChKey{index, term}] = rCh
+	// TODO: add lock
+	kv.mu.Lock()
+	key := noticeChKey{index, term}
+	kv.noticeChs[key] = rCh
+	kv.mu.Unlock()
 	select {
 	case r := <-rCh:
-		DPrintf(putAppendLog|serverLog, "[Server PutAppend rCh] %+v", r)
+		DPrintf(putAppendLog|serverLog, "[Server PutAppend rCh] me[%d(%p)] %+v key[%+v]", kv.me, kv.rf, r, key)
 		if r.succ == true {
 			reply.WrongLeader = false
 			reply.Err = OK
@@ -111,7 +120,7 @@ func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 func (kv *RaftKV) recvApplyMsg() {
 	for applyMsg := range kv.applyCh {
 		kv.mu.Lock() // need ? TODO
-		DPrintf(recvApplyMsgLog, "[Server recvApplyMsg] %p %+v %+v", kv.rf, applyMsg, applyMsg.Command)
+		DPrintf(recvApplyMsgLog, "[Server recvApplyMsg] me[%d(%p)] %+v %+v", kv.me, kv.rf, applyMsg, applyMsg.Command)
 		commandValid := applyMsg.CommandValid
 		if commandValid == true {
 			command := applyMsg.Command
@@ -221,6 +230,7 @@ func (kv *RaftKV) recvApplyMsg() {
 // turn off debug output from this instance.
 //
 func (kv *RaftKV) Kill() {
+	// TODO what should we do ?
 	kv.rf.Kill()
 	// Your code here, if desired.
 }
@@ -279,9 +289,11 @@ func (kv *RaftKV) readPersist(persister *raft.Persister) {
 		if err := d.Decode(&pKV); err != nil {
 			panic(err) // TODO should panic ?
 		}
-		DPrintf(readPersistLog, "[kv raft readPersist snapshot] %+v\n", pKV)
+		DPrintf(readPersistLog, "[kv raft readPersist snapshot] me[%d(%p)] %+v\n", kv.me, kv.rf, pKV)
+		kv.mu.Lock()
 		kv.store = pKV.Store
 		kv.dplDtc = pKV.DplDtc
+		kv.mu.Unlock()
 	}
 
 	// 再读取 raftstate
@@ -293,11 +305,12 @@ func (kv *RaftKV) readPersist(persister *raft.Persister) {
 		if err := d.Decode(&pRf); err != nil {
 			panic(err) // TODO should panic ?
 		}
-		DPrintf(readPersistLog, "[kv raft readPersist raftstate] %+v\n", pRf)
+		DPrintf(readPersistLog, "[kv raft readPersist raftstate] me[%d(%p)] %+v\n", kv.me, kv.rf, pRf)
 		log := pRf.Log
 		commitSliceIndex := kv.rf.LogIndexToSliceIndex(pRf.CommitIndex)
 		// TODO ignore pRf.lastApplied ??
 		// modify kv.rf.lastApplied = pRf.CommitIndex !! TODO
+		kv.mu.Lock()
 		for i := 0; i <= commitSliceIndex; i++ {
 			entry := log[i]
 			command := entry.Command
@@ -328,10 +341,13 @@ func (kv *RaftKV) readPersist(persister *raft.Persister) {
 					// error
 				}
 			} else {
-				DPrintf(readPersistLog, "xxxxxxxxx err op %v", op)
+				DPrintf(readPersistLog, "xxxxxxxxx err not op %v", op)
 			}
 		}
+		kv.mu.Unlock()
 	}
+
+	DPrintf(readPersistLog, "aftertttttttttttttttt %v %v", kv.store, kv.dplDtc)
 }
 
 /*

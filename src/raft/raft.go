@@ -369,7 +369,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		if falseReason != "" {
 			logStr = logStr + fmt.Sprintf(" [falseReason !!!] %v", falseReason)
 		}
-		DPrintln(rpcRecvLog|snapshotLog, logStr)
+		DPrintln(rpcRecvLog|installSnapshotLog, logStr)
 	}()
 
 	if args.Term < rf.currentTerm {
@@ -422,7 +422,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 }
 
 func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
-	DPrintf(rpcSendLog|snapshotLog,
+	DPrintf(rpcSendLog|installSnapshotLog,
 		"[sendingInstallSnapshot] [me]%d(%p) [currentTerm]%d [sendto]%d [args]%+v\n",
 		rf.me, rf, rf.currentTerm, server, args)
 	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
@@ -455,11 +455,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	if rf.state != LEADER {
 		isLeader = false
 	} else {
-		DPrintf(startLog, "[Start] [me]%d(%p) [currentTerm]%d [command]%v\n", rf.me, rf, rf.currentTerm, command)
 		rf.log = append(rf.log, Entry{rf.currentTerm, command})
-
 		index = rf.SliceIndexToLogIndex(len(rf.log) - 1)
 		term = rf.currentTerm
+		DPrintf(startLog, "[Start] [me]%d(%p) [currentTerm]%d [command]%v [index]%d\n", rf.me, rf, rf.currentTerm, command, index)
 	}
 	return index, term, isLeader
 }
@@ -811,23 +810,54 @@ func (rf *Raft) sendAppendEntriesWrapper(server int, currentTerm int) (retry boo
 	// 	rf.mu.Unlock()
 	// }()
 
-	// TODO 判断是否还是 leader
-
 	rf.mu.Lock()
-	var prevLogTerm int
+	// TODO 判断是否还是 leader, 非必须
+	if rf.state != LEADER {
+		return false, false
+	}
+
+	// 这里有点乱 TODO
 	// 这两个条件等价？可能只出现一个吗?好像不可能
-	if len(rf.log) == 0 || (rf.nextIndex[server]-1 == rf.snapshotLastIncludedIndex) {
-		// PrevLogIndex should be rf.snapshotLastIncludedIndex ? TODO
+	// 没关系啊
+
+	// var prevLogTerm int
+	// if len(rf.log) == 0 || (rf.nextIndex[server]-1 == rf.snapshotLastIncludedIndex) {
+	// 	// PrevLogIndex should be rf.snapshotLastIncludedIndex ? TODO
+	// 	fmt.Println("xxxxxxxxxx", len(rf.log), rf.nextIndex[server]-1, rf.snapshotLastIncludedIndex, rf.LogIndexToSliceIndex(rf.nextIndex[server]-1), rf.me, rf.currentTerm)
+	// 	prevLogTerm = rf.snapshotLastIncludedTerm
+	// } else {
+	// 	prevLogSliceIndex := rf.LogIndexToSliceIndex(rf.nextIndex[server] - 1)
+	// 	if prevLogSliceIndex < 0 {
+	// 		DPrintf(installSnapshotLog,
+	// 			"[willSendInstallSnapshot] [me]%d(%p) [currentTerm]%d [willSendto]%d "+
+	// 				"[reason] 1.rf.nextIndex[server]-1==%d prevLogSliceIndex==%d len(rf.log)==%d\n",
+	// 			rf.me, rf, currentTerm, server,
+	// 			rf.nextIndex[server]-1, prevLogSliceIndex, len(rf.log))
+	// 		rf.mu.Unlock()
+	// 		return false, true // TODO 什么情况会走到这里, 一个很久没跟 leader 同步的 follower
+	// 	}
+	// 	prevLogTerm = rf.log[prevLogSliceIndex].Term // TODO: 这里会出现 index out of range
+	// }
+
+	var prevLogTerm int
+	prevLogSliceIndex := rf.LogIndexToSliceIndex(rf.nextIndex[server] - 1)
+	if prevLogSliceIndex == -1 {
+		// the same as rf.nextIndex[server] - 1 == rf.snapshotLastIncludedIndex
 		prevLogTerm = rf.snapshotLastIncludedTerm
 	} else {
-		prevLogSliceIndex := rf.LogIndexToSliceIndex(rf.nextIndex[server] - 1)
-		if prevLogSliceIndex < 0 {
-			// TODO
+		// TODO prevLogSliceIndex >= len(rf.log) shoud be panic ?
+		// 什么情况下会出现 prevLogSliceIndex >= len(rf.log)
+		if prevLogSliceIndex < 0 { // || prevLogSliceIndex >= len(rf.log) {
+			DPrintf(installSnapshotLog,
+				"[willSendInstallSnapshot] [me]%d(%p) [currentTerm]%d [willSendto]%d "+
+					"[reason] 1.rf.nextIndex[server]-1==%d prevLogSliceIndex==%d len(rf.log)==%d\n",
+				rf.me, rf, currentTerm, server,
+				rf.nextIndex[server]-1, prevLogSliceIndex, len(rf.log))
 			rf.mu.Unlock()
-			// fmt.Println("aaaaaaaaaa", rf.me, server, rf.nextIndex[server]-1, prevLogSliceIndex, len(rf.log))
-			return false, true // TODO 什么情况会走到这里
+			return false, true
+		} else {
+			prevLogTerm = rf.log[prevLogSliceIndex].Term
 		}
-		prevLogTerm = rf.log[prevLogSliceIndex].Term // TODO: 这里会出现 index out of range
 	}
 
 	args := AppendEntriesArgs{
@@ -838,11 +868,18 @@ func (rf *Raft) sendAppendEntriesWrapper(server int, currentTerm int) (retry boo
 		LeaderCommit: rf.commitIndex,
 	}
 	nextSliceIndex := rf.LogIndexToSliceIndex(rf.nextIndex[server])
-	if nextSliceIndex < 0 {
+
+	if nextSliceIndex < 0 { // || nextSliceIndex >= len(rf.log) {
+		// TODO: 这里肯定不会过来了，rf.nextIndex[server] -1 过滤了？
+		DPrintf(installSnapshotLog,
+			"[willSendInstallSnapshot] [me]%d(%p) [currentTerm]%d [willSendto]%d "+
+				"[reason] 2.rf.nextIndex[server]==%d nextSliceIndex==%d len(rf.log)==%d\n",
+			rf.me, rf, currentTerm, server,
+			rf.nextIndex[server], nextSliceIndex, len(rf.log))
 		rf.mu.Unlock()
-		// fmt.Println("bbbbbbb", rf.nextIndex[server], nextSliceIndex, len(rf.log))
 		return false, true // TODO 什么情况会走到这里
 	}
+
 	lastSliceIndex := len(rf.log) - 1
 	if lastSliceIndex >= nextSliceIndex {
 		args.Entries = make([]Entry, lastSliceIndex+1-nextSliceIndex)
@@ -855,9 +892,6 @@ func (rf *Raft) sendAppendEntriesWrapper(server int, currentTerm int) (retry boo
 
 	if ok := rf.sendAppendEntries(server, &args, &reply); ok {
 		retry, installSnapshot = rf.handleAppendEntriesReply(&reply, lastLogIndex, server)
-		if installSnapshot == true {
-			// fmt.Println("ccccccccccc", rf.nextIndex[server])
-		}
 	} else {
 		retry = true
 	}
@@ -883,12 +917,13 @@ func (rf *Raft) handleAppendEntriesReply(reply *AppendEntriesReply, lastLogIndex
 				}()
 			} else {
 				rf.nextIndex[server] = rf.nextIndex[server] - 1
-				// if rf.nextIndex[server] > reply.LastApplied {
-				// 	rf.nextIndex[server] = reply.LastApplied + 1
-				// }
-				nextIndex := rf.LogIndexToSliceIndex(rf.nextIndex[server])
-				if nextIndex < 0 {
-					// TODO add log
+				nextSliceIndex := rf.LogIndexToSliceIndex(rf.nextIndex[server])
+				if nextSliceIndex < 0 {
+					DPrintf(installSnapshotLog,
+						"[willSendInstallSnapshot] [me]%d(%p) [currentTerm]%d [willSendto]%d "+
+							"[reason] 3.rf.nextIndex[server]==%d nextSliceIndex==%d len(rf.log)==%d\n",
+						rf.me, rf, rf.currentTerm, server,
+						rf.nextIndex[server], nextSliceIndex, len(rf.log))
 					return false, true
 				} else {
 					// TODO add log
@@ -983,3 +1018,37 @@ func (rf *Raft) SaveSnapshot(snapshot []byte, index int) {
 // 3、copy 误用
 
 // TODO: 为什么 raft 死锁了，test 就会卡住
+
+/*
+
+Test: persistence with several clients, failures, and snapshots, unreliable and partitions ...
+--- FAIL: TestSnapshotUnreliableRecoverConcurrentPartition3B (18.24s)
+	test_test.go:71: 0 missing element x 0 9 y in Append result x 0 0 yx 0 1 yx 0 2 yx 0 3 yx 0 4 yx 0 5 yx 0 6 yx 0 7 yx 0 8 yx 0 12 yx 0 13 y
+FAIL
+exit status 1
+FAIL	kvraft	190.618s
+
+Test: persistence with several clients, failures, and snapshots, unreliable and partitions ...
+--- FAIL: TestSnapshotUnreliableRecoverConcurrentPartition3B (18.65s)
+	test_test.go:71: 0 missing element x 0 5 y in Append result x 0 0 yx 0 1 yx 0 2 yx 0 3 yx 0 4 y
+FAIL
+exit status 1
+FAIL	kvraft	190.882s
+
+Test: persistence with several clients, failures, and snapshots, unreliable and partitions ...
+--- FAIL: TestSnapshotUnreliableRecoverConcurrentPartition3B (9.04s)
+	test_test.go:71: 0 missing element x 0 1 y in Append result x 0 0 y
+FAIL
+*/
+
+/*
+数组访问越界 837 line
+*/
+
+/*
+0502 三个问题
+1. TestSnapshotUnreliableRecoverConcurrentPartition3B 报错
+2. 什么情况下 837 会越界
+3. len(rf.log) == 0 明明有问题，怎么没反馈出来？
+// 好像没这个问题：and 怎么可能 len(rf.log) <= rf.nextIndex[server]-1
+*/

@@ -2,8 +2,8 @@ package raft
 
 import "log"
 
-// const debugLevel = snapshotLog | startLog | stateLog | appendEntriesLog
-const debugLevel = 0
+// const debugLevel = installSnapshotLog | startLog | stateLog | appendEntriesLog
+const debugLevel = 0xffff
 
 const rpcRecvLog = 0x0001
 const candidateSendLog = 0x0002
@@ -18,7 +18,7 @@ const persistLog = 0x0200
 
 const requestVoteLog = 0x1000
 const appendEntriesLog = 0x2000
-const snapshotLog = 0x4000
+const installSnapshotLog = 0x4000
 
 func DPrintf(level uint, format string, a ...interface{}) (n int, err error) {
 	if debugLevel&level != 0 {
