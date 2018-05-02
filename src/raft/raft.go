@@ -372,6 +372,14 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		DPrintln(rpcRecvLog|snapshotLog, logStr)
 	}()
 
+	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
+		reply.Success = false
+		falseReason = fmt.Sprintf("1. args.Term[%v] < rf.currentTerm[%v]",
+			args.Term, rf.currentTerm)
+		return
+	}
+
 	// TODO 考虑两个 applyCh 的并发，有没有可能有冲突
 	// 在前还是在后
 	go func() {
@@ -395,18 +403,12 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	rf.snapshotLastIncludedIndex = args.LastIncludedIndex
 	rf.snapshotLastIncludedTerm = args.LastIncludedTerm
 
-	fmt.Println("11111111111111111111111111", rf.lastApplied, args.LastIncludedIndex)
+	// fmt.Println("11111111111111111111111111", rf.lastApplied, args.LastIncludedIndex)
+	// TODO: 是不是不可能发生 rf.lastApplied > args.LastIncludedIndex
+	// 应该是。leader change，nextIndex 会从最高开始逐步递减，老 leader 也不会发生这种事
 	rf.lastApplied = args.LastIncludedIndex
 	if rf.commitIndex < rf.lastApplied {
 		rf.commitIndex = rf.lastApplied
-	}
-
-	if args.Term < rf.currentTerm {
-		reply.Term = rf.currentTerm
-		reply.Success = false
-		falseReason = fmt.Sprintf("1. args.Term[%v] < rf.currentTerm[%v]",
-			args.Term, rf.currentTerm)
-		return
 	}
 
 	rf.currentTerm = args.Term
