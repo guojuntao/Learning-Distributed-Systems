@@ -164,7 +164,7 @@ func (rf *Raft) readPersist(data []byte) {
 	rf.votedFor = pRf.VotedFor
 	rf.log = pRf.Log
 	rf.commitIndex = pRf.CommitIndex
-	rf.lastApplied = pRf.LastApplied
+	rf.lastApplied = pRf.LastApplied // TODO: 持久化不存 lastApplied，rf.lastApplied = pRf.CommitIndex
 	rf.snapshotLastIncludedIndex = pRf.SnapshotLastIncludedIndex
 	rf.snapshotLastIncludedTerm = pRf.SnapshotLastIncludedTerm
 	rf.mu.Unlock()
@@ -565,7 +565,9 @@ func (rf *Raft) Apply() {
 			sliceIndex := rf.LogIndexToSliceIndex(rf.lastApplied)
 			entry := rf.log[sliceIndex]
 			index := rf.lastApplied
-			// fmt.Println("rf.lastApplied", rf.me, rf.lastApplied, entry)
+
+			DPrintf(applyLog, "[Apply] [me]%d(%p) [currentTerm]%d [command]%+v [commitIndex]%d",
+				rf.me, rf, rf.currentTerm, entry.Command, index)
 			rf.mu.Unlock()
 			// TODO when persist
 
@@ -816,12 +818,11 @@ func (rf *Raft) sendAppendEntriesWrapper(server int, currentTerm int) (retry boo
 	rf.mu.Lock()
 	// TODO 判断是否还是 leader, 非必须
 	if rf.state != LEADER {
+		rf.mu.Unlock()
 		return false, false
 	}
 
-	// 这里有点乱 TODO
-	// 这两个条件等价？可能只出现一个吗?好像不可能
-	// 没关系啊
+	// TODO 这种情况是不符合逻辑的(不用判断 len(rf.log) == 0 )，但是没有出过错，看看为什么不出错
 
 	// var prevLogTerm int
 	// if len(rf.log) == 0 || (rf.nextIndex[server]-1 == rf.snapshotLastIncludedIndex) {
@@ -942,13 +943,12 @@ func (rf *Raft) handleAppendEntriesReply(reply *AppendEntriesReply, lastLogIndex
 	return retry, installSnapshot
 }
 
-// should be called after rf.mu.Lock()
-// TODO index --> server
-func (rf *Raft) incMactchIndex(matchIndex int, index int) {
-	// fmt.Println("matchIndex", matchIndex, "index", index, rf.matchIndex[index])
-	if rf.matchIndex[index] != matchIndex {
-		rf.nextIndex[index] = matchIndex + 1
-		rf.matchIndex[index] = matchIndex
+// caller must hold rf.mu
+func (rf *Raft) incMactchIndex(matchIndex int, server int) {
+	// fmt.Println("matchIndex", matchIndex, "server", server, rf.matchIndex[server])
+	if rf.matchIndex[server] != matchIndex {
+		rf.nextIndex[server] = matchIndex + 1
+		rf.matchIndex[server] = matchIndex
 
 		cnt := 0
 		for _, idx := range rf.matchIndex {
@@ -969,12 +969,13 @@ func (rf *Raft) incMactchIndex(matchIndex int, index int) {
 	}
 }
 
-// call before rf.Lock
+// TODO LogIndexToSliceIndexUnlocked, 会不会名字太长被绕晕了。。。
+// caller must hold rf.mu
 func (rf *Raft) LogIndexToSliceIndex(logIndex int) (sliceIndex int) {
 	return logIndex - rf.snapshotLastIncludedIndex - 1
 }
 
-// call before rf.Lock
+// caller must hold rf.mu
 func (rf *Raft) SliceIndexToLogIndex(sliceIndex int) (logIndex int) {
 	return sliceIndex + rf.snapshotLastIncludedIndex + 1
 }
@@ -988,10 +989,14 @@ func (rf *Raft) SaveSnapshot(snapshot []byte, index int) {
 	defer rf.mu.Unlock()
 	rf.persister.SaveSnapshot(snapshot)
 
+	// TODO 添加日志，trim log
+
 	// discard log
 	sliceIndex := rf.LogIndexToSliceIndex(index)
 	if sliceIndex < 0 || sliceIndex >= len(rf.log) {
-		panic("impossible here") // 不会走到这里
+		fmt.Printf("raft[%+v], len(rf.log)[%d] index[%d] sliceIndex[%d]",
+			rf, len(rf.log), index, sliceIndex)
+		panic("impossible here") // 不会走到这里 // TODO: 跑过一次这里......
 	}
 	rf.snapshotLastIncludedIndex = index
 	rf.snapshotLastIncludedTerm = rf.log[sliceIndex].Term
@@ -1011,38 +1016,7 @@ func (rf *Raft) SaveSnapshot(snapshot []byte, index int) {
 	return
 }
 
-// 5月2日凌晨 debug 修改三处
-// 1、incMactchIndex 调用的 index 没用 logIndex 用了 sliceIndex
-// 2、installSnapshot RPC
-//		if args.PrevLogIndex == rf.snapshotLastIncludedIndex {
-//			term = rf.snapshotLastIncludedTerm
-//		}
-//    还有几个点也是临界 lastInclude* 的问题
-// 3、copy 误用
-
 // TODO: 为什么 raft 死锁了，test 就会卡住
-
-/*
-
-Test: persistence with several clients, failures, and snapshots, unreliable and partitions ...
---- FAIL: TestSnapshotUnreliableRecoverConcurrentPartition3B (18.24s)
-	test_test.go:71: 0 missing element x 0 9 y in Append result x 0 0 yx 0 1 yx 0 2 yx 0 3 yx 0 4 yx 0 5 yx 0 6 yx 0 7 yx 0 8 yx 0 12 yx 0 13 y
-FAIL
-exit status 1
-FAIL	kvraft	190.618s
-
-Test: persistence with several clients, failures, and snapshots, unreliable and partitions ...
---- FAIL: TestSnapshotUnreliableRecoverConcurrentPartition3B (18.65s)
-	test_test.go:71: 0 missing element x 0 5 y in Append result x 0 0 yx 0 1 yx 0 2 yx 0 3 yx 0 4 y
-FAIL
-exit status 1
-FAIL	kvraft	190.882s
-
-Test: persistence with several clients, failures, and snapshots, unreliable and partitions ...
---- FAIL: TestSnapshotUnreliableRecoverConcurrentPartition3B (9.04s)
-	test_test.go:71: 0 missing element x 0 1 y in Append result x 0 0 y
-FAIL
-*/
 
 /*
 数组访问越界 837 line
@@ -1055,3 +1029,5 @@ FAIL
 3. len(rf.log) == 0 明明有问题，怎么没反馈出来？
 // 好像没这个问题：and 怎么可能 len(rf.log) <= rf.nextIndex[server]-1
 */
+
+// 进入函数时 lock，出去没有 unlock，应该怎么检测
