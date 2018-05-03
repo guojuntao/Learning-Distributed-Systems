@@ -15,6 +15,7 @@ const stateLog = 0x0040
 
 const getRandTimeLog = 0x0100
 const persistLog = 0x0200
+const applyLog = 0x0400
 
 const requestVoteLog = 0x1000
 const appendEntriesLog = 0x2000

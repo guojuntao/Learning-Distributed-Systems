@@ -313,6 +313,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		if args.PrevLogTerm == term {
 			rf.log = rf.log[:prevLogSliceIndex+1]
 			rf.log = append(rf.log, args.Entries...)
+			// TODO args.LeaderCommit 以及之前的log，一定包含在 args.Entries 里面吗
 			if rf.commitIndex < args.LeaderCommit { // TODO: 需要判断吗，如果小于会怎样
 				rf.commitIndex = args.LeaderCommit
 				go rf.Apply()
@@ -356,6 +357,7 @@ type InstallSnapshotReply struct {
 	Success bool
 }
 
+// 是不是冥等的，重复接收会怎样 TODO
 func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -384,6 +386,8 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	// 在前还是在后
 	// 这里是异步的，有没有问题 TODO
 	go func() {
+		DPrintf(applyLog, "[Apply] [me]%d(%p) [currentTerm]%d [snapshot]%+v",
+			rf.me, rf, rf.currentTerm, args.Data)
 		rf.applyCh <- ApplyMsg{
 			CommandValid: false,
 			Snapshot:     args.Data,
@@ -393,6 +397,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	rf.persister.SaveSnapshot(args.Data)
 	// trim log
 	sliceIndex := rf.LogIndexToSliceIndex(args.LastIncludedIndex)
+	// TODO log
 	// fmt.Println("before trim log", rf.log, args.LastIncludedIndex, rf.snapshotLastIncludedIndex, sliceIndex, len(rf.log))
 	if sliceIndex >= 0 && sliceIndex+1 < len(rf.log) {
 		tmpLog := make([]Entry, len(rf.log)-1-sliceIndex)
@@ -409,7 +414,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	// fmt.Println("11111111111111111111111111", rf.lastApplied, args.LastIncludedIndex)
 	// TODO: 是不是不可能发生 rf.lastApplied > args.LastIncludedIndex
 	// 应该是。leader change，nextIndex 会从最高开始逐步递减，老 leader 也不会发生这种事
-	rf.lastApplied = args.LastIncludedIndex
+	rf.lastApplied = args.LastIncludedIndex // TODO  is it right ???
 	if rf.commitIndex < rf.lastApplied {
 		rf.commitIndex = rf.lastApplied
 	}
@@ -570,6 +575,9 @@ func (rf *Raft) Apply() {
 				rf.me, rf, rf.currentTerm, entry.Command, index)
 			rf.mu.Unlock()
 			// TODO when persist
+
+			// 在这中间可能发生 apply snapshot，也没关系，kvraft 会 duplicate
+			// 总觉得这个过程被中断， ( unlock, applyCh<- ) 隐约觉得有隐患，不中断又可能被阻塞
 
 			rf.applyCh <- ApplyMsg{
 				CommandValid: true,
@@ -753,7 +761,7 @@ func (rf *Raft) enterLeaderState() {
 								// TODO: ok != true, retry
 								if ok := rf.sendInstallSnapshot(server, &args, &reply); ok {
 									rf.mu.Lock()
-									// TODO: 这两个数值给多少
+									// TODO: 这两个数值给多少, 两个 if 是不是没必要
 									if rf.matchIndex[server] < args.LastIncludedIndex {
 										rf.matchIndex[server] = args.LastIncludedIndex
 									}
@@ -987,17 +995,32 @@ func (rf *Raft) RaftStateSize() int {
 func (rf *Raft) SaveSnapshot(snapshot []byte, index int) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	rf.persister.SaveSnapshot(snapshot)
 
 	// TODO 添加日志，trim log
 
 	// discard log
 	sliceIndex := rf.LogIndexToSliceIndex(index)
-	if sliceIndex < 0 || sliceIndex >= len(rf.log) {
-		fmt.Printf("raft[%+v], len(rf.log)[%d] index[%d] sliceIndex[%d]",
+	if sliceIndex < 0 { // || sliceIndex >= len(rf.log) {
+		/*
+					sliceIndex 可能小于 0, 考虑以下场景，纵轴向下表示时间增加
+
+					raft.goroutine1   raft.goroutine2  kvraft.goroutine3
+						|					|				|
+						|			rf.Unlock;  apply->     |
+						|					|				|
+			recv InstallSnapshot RPC		|				|
+				change raft state			|				|
+						|					|				|
+						|					|				|
+						|					|	<- apply; detect big size, saveSnapshot
+						|					|		will detect index < rf.snapshotLastIncludedIndex
+		*/
+		// TODO log
+		fmt.Printf("raft[%+v], len(rf.log)[%d] index[%d] sliceIndex[%d]\n",
 			rf, len(rf.log), index, sliceIndex)
-		panic("impossible here") // 不会走到这里 // TODO: 跑过一次这里......
+		return
 	}
+
 	rf.snapshotLastIncludedIndex = index
 	rf.snapshotLastIncludedTerm = rf.log[sliceIndex].Term
 
@@ -1011,6 +1034,7 @@ func (rf *Raft) SaveSnapshot(snapshot []byte, index int) {
 	}
 	// fmt.Println(rf.me, "xxx after trim log", rf.log, len(rf.log))
 
+	rf.persister.SaveSnapshot(snapshot)
 	rf.persist()
 
 	return
