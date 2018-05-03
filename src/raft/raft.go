@@ -382,12 +382,15 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 
 	// TODO 考虑两个 applyCh 的并发，有没有可能有冲突
 	// 在前还是在后
+	// 这里是异步的，有没有问题 TODO
 	go func() {
 		rf.applyCh <- ApplyMsg{
 			CommandValid: false,
 			Snapshot:     args.Data,
 		}
 	}()
+
+	rf.persister.SaveSnapshot(args.Data)
 	// trim log
 	sliceIndex := rf.LogIndexToSliceIndex(args.LastIncludedIndex)
 	// fmt.Println("before trim log", rf.log, args.LastIncludedIndex, rf.snapshotLastIncludedIndex, sliceIndex, len(rf.log))
