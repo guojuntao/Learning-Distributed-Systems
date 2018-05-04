@@ -265,6 +265,10 @@ type AppendEntriesReply struct {
 	Success bool
 }
 
+// TODO 如果乱序，比如 Append log[2] 后，上一条重复 Append log[1] 的 RPC 到达，log[2] 消失
+// 这时候，leader 记录的 matchIndex 就会有问题。假如 leader 刚好把 commitIndex = 2，然后挂了
+// 重新选举时，log[2] 曾今存在但现在没有的节点，就可能会投票给从来没有 log[2] 的节点，导致问题
+// 解决方法，靠 RPC 机制保证之前接收过的请求不再进入？
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -362,7 +366,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	// defer fmt.Println("size", rf.persister.RaftStateSize())
-	defer rf.persist()
+	defer rf.persist() // TODO 不要放在 defer
 
 	var falseReason string
 	defer func() {
@@ -381,6 +385,41 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 			args.Term, rf.currentTerm)
 		return
 	}
+	rf.currentTerm = args.Term
+
+	sliceIndex := rf.LogIndexToSliceIndex(args.LastIncludedIndex)
+	if sliceIndex == -1 { // the same as args.LastIncludedIndex == rf.snapshotLastIncludedIndex
+		if args.LastIncludedTerm == rf.snapshotLastIncludedTerm {
+			reply.Term = rf.currentTerm
+			reply.Success = false
+			falseReason = fmt.Sprintf("2. sliceIndex[%v] "+
+				"rf.snapshotLastIncludedIndex[%v] rf.snapshotLastIncludedTerm[%v]",
+				sliceIndex, rf.snapshotLastIncludedIndex, rf.snapshotLastIncludedTerm)
+			return
+		}
+	}
+	if sliceIndex < 0 {
+		reply.Term = rf.currentTerm
+		reply.Success = false
+		falseReason = fmt.Sprintf("3. sliceIndex[%v] "+
+			"rf.snapshotLastIncludedIndex[%v]",
+			sliceIndex, rf.snapshotLastIncludedIndex)
+		return
+	}
+	// if sliceIndex >= 0 && sliceIndex < len(rf.log) {
+	if sliceIndex < len(rf.log) {
+		if rf.log[sliceIndex].Term == args.LastIncludedTerm {
+			reply.Term = rf.currentTerm
+			reply.Success = false
+			falseReason = fmt.Sprintf("4. sliceIndex[%v] len(rf.log)[%v]",
+				sliceIndex, len(rf.log))
+			return
+		}
+	}
+	// TODO if sliceIndex < 0, 会不会有问题 ？
+	// if sliceIndex < 0 {
+	// 	panic(fmt.Sprintf("raft[%+v], sliceIndex[%d]\n", rf, sliceIndex))
+	// }
 
 	// TODO 考虑两个 applyCh 的并发，有没有可能有冲突
 	// 在前还是在后
@@ -393,39 +432,44 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 			Snapshot:     args.Data,
 		}
 	}()
-
 	rf.persister.SaveSnapshot(args.Data)
-	// trim log
-	sliceIndex := rf.LogIndexToSliceIndex(args.LastIncludedIndex)
-	// TODO log
-	// fmt.Println("before trim log", rf.log, args.LastIncludedIndex, rf.snapshotLastIncludedIndex, sliceIndex, len(rf.log))
-	if sliceIndex >= 0 && sliceIndex+1 < len(rf.log) {
-		tmpLog := make([]Entry, len(rf.log)-1-sliceIndex)
-		copy(tmpLog, rf.log[sliceIndex+1:])
-		rf.log = tmpLog
-	} else {
-		rf.log = make([]Entry, 0, 128)
-	}
-	// fmt.Println("after trim log", rf.log, args.LastIncludedIndex)
 
+	// // trim log
+	// sliceIndex := rf.LogIndexToSliceIndex(args.LastIncludedIndex)
+	// // TODO log
+	// // fmt.Println("before trim log", rf.log, args.LastIncludedIndex, rf.snapshotLastIncludedIndex, sliceIndex, len(rf.log))
+	// if sliceIndex >= 0 && sliceIndex+1 < len(rf.log) {
+	// 	tmpLog := make([]Entry, len(rf.log)-1-sliceIndex)
+	// 	copy(tmpLog, rf.log[sliceIndex+1:])
+	// 	rf.log = tmpLog
+	// } else {
+	// 	rf.log = make([]Entry, 0, 128)
+	// }
+	// // fmt.Println("after trim log", rf.log, args.LastIncludedIndex)
+
+	// rf.snapshotLastIncludedIndex = args.LastIncludedIndex
+	// rf.snapshotLastIncludedTerm = args.LastIncludedTerm
+
+	// // fmt.Println("11111111111111111111111111", rf.lastApplied, args.LastIncludedIndex)
+	// // TODO: 是不是不可能发生 rf.lastApplied > args.LastIncludedIndex
+	// // 应该是。leader change，nextIndex 会从最高开始逐步递减，老 leader 也不会发生这种事
+	// rf.lastApplied = args.LastIncludedIndex // TODO  is it right ???
+	// if rf.commitIndex < rf.lastApplied {
+	// 	rf.commitIndex = rf.lastApplied
+	// }
+
+	rf.log = make([]Entry, 0, 128)
 	rf.snapshotLastIncludedIndex = args.LastIncludedIndex
 	rf.snapshotLastIncludedTerm = args.LastIncludedTerm
+	rf.lastApplied = args.LastIncludedIndex
+	rf.commitIndex = args.LastIncludedIndex
 
-	// fmt.Println("11111111111111111111111111", rf.lastApplied, args.LastIncludedIndex)
-	// TODO: 是不是不可能发生 rf.lastApplied > args.LastIncludedIndex
-	// 应该是。leader change，nextIndex 会从最高开始逐步递减，老 leader 也不会发生这种事
-	rf.lastApplied = args.LastIncludedIndex // TODO  is it right ???
-	if rf.commitIndex < rf.lastApplied {
-		rf.commitIndex = rf.lastApplied
-	}
-
-	rf.currentTerm = args.Term
 	go func() {
 		rf.tobeFollowerCh <- struct{}{}
 	}()
+
 	reply.Term = rf.currentTerm
 	reply.Success = true
-
 	return
 }
 
@@ -684,6 +728,7 @@ func (rf *Raft) enterCandidateState() {
 			// TODO: need stop timer/ close voteCh?
 			return
 		case reply := <-voteCh:
+			// TODO 最好加个 map 记录每个 peer 的投票情况，这样可以重试 sendRequestVote
 			if reply.VoteGranted == false {
 				rf.mu.Lock()
 				if reply.Term > rf.currentTerm {
