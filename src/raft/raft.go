@@ -218,6 +218,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		if args.Term > rf.currentTerm {
 			rf.currentTerm = args.Term
 			rf.votedFor = -1
+			rf.state = FOLLOWER
 			go func() {
 				rf.tobeFollowerCh <- struct{}{}
 			}()
@@ -230,6 +231,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	} else {
 		rf.currentTerm = args.Term
 		rf.votedFor = args.CandidateId
+		rf.state = FOLLOWER
 		go func() {
 			rf.tobeFollowerCh <- struct{}{}
 		}()
@@ -298,6 +300,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
 	}
+	rf.state = FOLLOWER
 	go func() {
 		rf.tobeFollowerCh <- struct{}{}
 	}()
@@ -398,7 +401,8 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 			return
 		}
 	}
-	if sliceIndex < 0 {
+	// TODO 这样处理好吗, 什么场景会发生这种情况？旧快照由于网络原因，比如延时，后面才到达
+	if sliceIndex < 0 { // 说明 snapshot 的内容已经全部包含了
 		reply.Term = rf.currentTerm
 		reply.Success = false
 		falseReason = fmt.Sprintf("3. sliceIndex[%v] "+
@@ -458,12 +462,15 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	// 	rf.commitIndex = rf.lastApplied
 	// }
 
+	// TODO add log, before/afer
+	// 直接丢弃快照，这样有问题，比如快照包含了 rf.log 的前部分，后部分丢了，但 leader 不知道丢了，这种情况跟 AppendEntries 乱序有点像 TODO
 	rf.log = make([]Entry, 0, 128)
 	rf.snapshotLastIncludedIndex = args.LastIncludedIndex
 	rf.snapshotLastIncludedTerm = args.LastIncludedTerm
 	rf.lastApplied = args.LastIncludedIndex
 	rf.commitIndex = args.LastIncludedIndex
 
+	rf.state = FOLLOWER
 	go func() {
 		rf.tobeFollowerCh <- struct{}{}
 	}()
@@ -620,6 +627,7 @@ func (rf *Raft) Apply() {
 			rf.mu.Unlock()
 			// TODO when persist
 
+			// TODO
 			// 在这中间可能发生 apply snapshot，也没关系，kvraft 会 duplicate
 			// 总觉得这个过程被中断， ( unlock, applyCh<- ) 隐约觉得有隐患，不中断又可能被阻塞
 
@@ -722,9 +730,9 @@ func (rf *Raft) enterCandidateState() {
 			// TODO: need close voteCh?
 			return
 		case <-rf.tobeFollowerCh:
-			rf.mu.Lock()
-			rf.state = FOLLOWER
-			rf.mu.Unlock()
+			// rf.mu.Lock()
+			// rf.state = FOLLOWER
+			// rf.mu.Unlock()
 			// TODO: need stop timer/ close voteCh?
 			return
 		case reply := <-voteCh:
@@ -830,9 +838,9 @@ func (rf *Raft) enterLeaderState() {
 			}
 
 		case <-rf.tobeFollowerCh:
-			rf.mu.Lock()
-			rf.state = FOLLOWER
-			rf.mu.Unlock()
+			// rf.mu.Lock()
+			// rf.state = FOLLOWER
+			// rf.mu.Unlock()
 			// TODO: need stop ticker?
 			ticker.Stop()
 			return
@@ -913,6 +921,7 @@ func (rf *Raft) sendAppendEntriesWrapper(server int, currentTerm int) (retry boo
 			rf.mu.Unlock()
 			return false, true
 		} else {
+			fmt.Printf("xxxxxxxxxxxxxxxxx %p[raft]%+v len(rf.log)%d server(%d) prevLogSliceIndex%d\n", rf, rf, len(rf.log), server, prevLogSliceIndex)
 			prevLogTerm = rf.log[prevLogSliceIndex].Term
 		}
 	}
@@ -969,6 +978,7 @@ func (rf *Raft) handleAppendEntriesReply(reply *AppendEntriesReply, lastLogIndex
 				rf.currentTerm = reply.Term
 				rf.votedFor = -1
 				rf.persist()
+				rf.state = FOLLOWER
 				go func() {
 					rf.tobeFollowerCh <- struct{}{}
 				}()
@@ -1041,9 +1051,6 @@ func (rf *Raft) SaveSnapshot(snapshot []byte, index int) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	// TODO 添加日志，trim log
-
-	// discard log
 	sliceIndex := rf.LogIndexToSliceIndex(index)
 	if sliceIndex < 0 { // || sliceIndex >= len(rf.log) {
 		/*
@@ -1060,16 +1067,22 @@ func (rf *Raft) SaveSnapshot(snapshot []byte, index int) {
 						|					|	<- apply; detect big size, saveSnapshot
 						|					|		will detect index < rf.snapshotLastIncludedIndex
 		*/
-		// TODO log
-		fmt.Printf("raft[%+v], len(rf.log)[%d] index[%d] sliceIndex[%d]\n",
-			rf, len(rf.log), index, sliceIndex)
+		DPrintf(saveSnapshotLog, "[saveSnapshot][failed] [me]%d(%p) [raft]%+v "+
+			"[len(rf.log)]%d [index]%d [sliceIndex]%d",
+			rf.me, rf, rf, len(rf.log), index, sliceIndex)
 		return
 	}
+
+	DPrintf(saveSnapshotLog, "[saveSnapshot][before] [me]%d(%p) [currentTerm]%d "+
+		"[rf.snapshotLastIncludedIndex]%d [rf.snapshotLastIncludedTerm]%d"+
+		"[rf.log]%+v [len(rf.log)]%d, [index]%d, [sliceIndex]%d",
+		rf.me, rf, rf.currentTerm, rf.snapshotLastIncludedIndex,
+		rf.snapshotLastIncludedTerm, rf.log, len(rf.log), index, sliceIndex)
 
 	rf.snapshotLastIncludedIndex = index
 	rf.snapshotLastIncludedTerm = rf.log[sliceIndex].Term
 
-	// fmt.Println(rf.me, "xxxx before trim log", rf.log, len(rf.log), index, sliceIndex)
+	// discard log
 	if sliceIndex == (len(rf.log) - 1) {
 		rf.log = make([]Entry, 0, 128)
 	} else {
@@ -1077,10 +1090,15 @@ func (rf *Raft) SaveSnapshot(snapshot []byte, index int) {
 		copy(tmpLog, rf.log[sliceIndex+1:])
 		rf.log = tmpLog
 	}
-	// fmt.Println(rf.me, "xxx after trim log", rf.log, len(rf.log))
 
 	rf.persister.SaveSnapshot(snapshot)
 	rf.persist()
+
+	DPrintf(saveSnapshotLog, "[saveSnapshot][after] [me]%d(%p) [currentTerm]%d "+
+		"[rf.snapshotLastIncludedIndex]%d [rf.snapshotLastIncludedTerm]%d"+
+		"[rf.log]%+v [len(rf.log)]%d",
+		rf.me, rf, rf.currentTerm, rf.snapshotLastIncludedIndex,
+		rf.snapshotLastIncludedTerm, rf.log, len(rf.log))
 
 	return
 }

@@ -3,7 +3,8 @@ package raft
 import "log"
 
 // const debugLevel = installSnapshotLog | startLog | stateLog | appendEntriesLog
-const debugLevel = 0xffff
+// TODO 通过环境变量设置 debugLevel
+const debugLevel = 0xfffff
 
 const rpcRecvLog = 0x0001
 const candidateSendLog = 0x0002
@@ -20,6 +21,8 @@ const applyLog = 0x0400
 const requestVoteLog = 0x1000
 const appendEntriesLog = 0x2000
 const installSnapshotLog = 0x4000
+
+const saveSnapshotLog = 0x10000
 
 func DPrintf(level uint, format string, a ...interface{}) (n int, err error) {
 	if debugLevel&level != 0 {
